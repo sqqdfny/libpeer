@@ -270,10 +270,10 @@ static int dtls_srtp_key_derivation(DtlsSrtp* dtls_srtp, const unsigned char* ma
   printf("\n");
 #endif
 
-  const uint8_t* client_key = key_material;
-  const uint8_t* server_key = client_key + SRTP_MASTER_KEY_LENGTH;
-  const uint8_t* client_salt = server_key + SRTP_MASTER_KEY_LENGTH;
-  const uint8_t* server_salt = client_salt + SRTP_MASTER_SALT_LENGTH;
+  uint8_t* client_key = key_material;
+  uint8_t* server_key = client_key + SRTP_MASTER_KEY_LENGTH;
+  uint8_t* client_salt = server_key + SRTP_MASTER_KEY_LENGTH;
+  uint8_t* server_salt = client_salt + SRTP_MASTER_SALT_LENGTH;
   uint8_t *local_key, *remote_key, *local_salt, *remote_salt;
   if (dtls_srtp->role == DTLS_SRTP_ROLE_SERVER) {
     local_key = server_key;

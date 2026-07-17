@@ -194,7 +194,7 @@ void sctp_parse_data_channel_open(Sctp* sctp, uint16_t sid, char* data, size_t l
     // Add stream mapping
     sctp_add_stream_mapping(sctp, label_str, sid);
     char ack = DATA_CHANNEL_ACK;
-    sctp_outgoing_data(sctp, &ack, 1, DATA_CHANNEL_PPID_CONTROL, sid);
+    sctp_outgoing_data(sctp, &ack, 1, (SctpDataPpid)DATA_CHANNEL_PPID_CONTROL, sid);
   }
 }
 
