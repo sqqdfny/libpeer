@@ -44,7 +44,9 @@ typedef struct DtlsSrtp {
   mbedtls_ssl_cookie_ctx cookie_ctx;
   mbedtls_x509_crt cert;
   mbedtls_pk_context pkey;
+#ifndef LIBPEER_USE_SHARED_ENTROPY
   mbedtls_entropy_context entropy;
+#endif
   mbedtls_ctr_drbg_context ctr_drbg;
 
   // SRTP

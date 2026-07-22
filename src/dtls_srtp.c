@@ -15,6 +15,11 @@
 #include "socket.h"
 #include "utils.h"
 
+/* 当未启用共享熵源时，LIBPEER_ENTROPY_CTX 回退到原有的结构体字段指针 */
+#ifndef LIBPEER_ENTROPY_CTX
+#define LIBPEER_ENTROPY_CTX   (&dtls_srtp->entropy)
+#endif
+
 int dtls_srtp_udp_send(void* ctx, const uint8_t* buf, size_t len) {
   DtlsSrtp* dtls_srtp = (DtlsSrtp*)ctx;
   UdpSocket* udp_socket = (UdpSocket*)dtls_srtp->user_data;
@@ -85,7 +90,7 @@ static int dtls_srtp_selfsign_cert(DtlsSrtp* dtls_srtp) {
     return -1;
   }
 
-  mbedtls_ctr_drbg_seed(&dtls_srtp->ctr_drbg, mbedtls_entropy_func, &dtls_srtp->entropy, (const unsigned char*)pers, strlen(pers));
+  mbedtls_ctr_drbg_seed(&dtls_srtp->ctr_drbg, mbedtls_entropy_func, LIBPEER_ENTROPY_CTX, (const unsigned char*)pers, strlen(pers));
 
 #if CONFIG_DTLS_USE_ECDSA
   mbedtls_pk_setup(&dtls_srtp->pkey, mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY));
@@ -164,7 +169,9 @@ int dtls_srtp_init(DtlsSrtp* dtls_srtp, DtlsSrtpRole role, void* user_data) {
 
   mbedtls_x509_crt_init(&dtls_srtp->cert);
   mbedtls_pk_init(&dtls_srtp->pkey);
+#ifndef LIBPEER_USE_SHARED_ENTROPY
   mbedtls_entropy_init(&dtls_srtp->entropy);
+#endif
   mbedtls_ctr_drbg_init(&dtls_srtp->ctr_drbg);
 #if CONFIG_MBEDTLS_DEBUG
   mbedtls_debug_set_threshold(3);
@@ -224,7 +231,9 @@ void dtls_srtp_deinit(DtlsSrtp* dtls_srtp) {
 
   mbedtls_x509_crt_free(&dtls_srtp->cert);
   mbedtls_pk_free(&dtls_srtp->pkey);
+#ifndef LIBPEER_USE_SHARED_ENTROPY
   mbedtls_entropy_free(&dtls_srtp->entropy);
+#endif
   mbedtls_ctr_drbg_free(&dtls_srtp->ctr_drbg);
 
   if (dtls_srtp->role == DTLS_SRTP_ROLE_SERVER) {
