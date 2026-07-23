@@ -395,36 +395,46 @@ int agent_recv(Agent* agent, uint8_t* buf, int len) {
 }
 
 void agent_set_remote_description(Agent* agent, char* description) {
-  /*
-  a=ice-ufrag:Iexb
-  a=ice-pwd:IexbSoY7JulyMbjKwISsG9
-  a=candidate:1 1 UDP 1 36.231.28.50 38143 typ srflx
-  */
-  int i;
+    /*
+    a=ice-ufrag:Iexb
+    a=ice-pwd:IexbSoY7JulyMbjKwISsG9
+    a=candidate:1 1 UDP 1 36.231.28.50 38143 typ srflx
+    */
+    int i;
 
-  LOGD("Set remote description:\n%s", description);
+    LOGD("Set remote description:\n%s", description);
 
-  char* line_start = description;
-  char* line_end = NULL;
+    char* line_start = description;
+    char* line_end = NULL;
+    agent->remote_ufrag[0] = '\0';
+    agent->remote_upwd[0] = '\0';
+    while ((line_end = strstr(line_start, "\r\n")) != NULL) {
+    if (strncmp(line_start, "a=ice-ufrag:", sizeof("a=ice-ufrag:") - 1) == 0) {
+        line_start += sizeof("a=ice-ufrag:") - 1;
+        size_t len = line_end - line_start;
+        len = len >= sizeof(agent->remote_ufrag) ? (sizeof(agent->remote_ufrag) - 1) : len;
+        strncpy(agent->remote_ufrag, line_start, len);
+        agent->remote_ufrag[len] = '\0';
+    } else
+    if (strncmp(line_start, "a=ice-pwd:", sizeof("a=ice-pwd:") - 1) == 0) {
+        line_start += sizeof("a=ice-pwd:") - 1;
+        size_t len = line_end - line_start;
+        len = len >= sizeof(agent->remote_upwd) ? (sizeof(agent->remote_upwd) - 1) : len;
+        strncpy(agent->remote_upwd, line_start, len);
+        agent->remote_upwd[len] = '\0';
+    } else
+    if (strncmp(line_start, "a=candidate:", sizeof("a=candidate:") - 1) == 0) {
 
-  while ((line_end = strstr(line_start, "\r\n")) != NULL) {
-    if (strncmp(line_start, "a=ice-ufrag:", strlen("a=ice-ufrag:")) == 0) {
-      strncpy(agent->remote_ufrag, line_start + strlen("a=ice-ufrag:"), line_end - line_start - strlen("a=ice-ufrag:"));
-
-    } else if (strncmp(line_start, "a=ice-pwd:", strlen("a=ice-pwd:")) == 0) {
-      strncpy(agent->remote_upwd, line_start + strlen("a=ice-pwd:"), line_end - line_start - strlen("a=ice-pwd:"));
-
-    } else if (strncmp(line_start, "a=candidate:", strlen("a=candidate:")) == 0) {
-      if (ice_candidate_from_description(&agent->remote_candidates[agent->remote_candidates_count], line_start, line_end) == 0) {
-        for (i = 0; i < agent->remote_candidates_count; i++) {
-          if (strcmp(agent->remote_candidates[i].foundation, agent->remote_candidates[agent->remote_candidates_count].foundation) == 0) {
-            break;
-          }
+        if (ice_candidate_from_description(&agent->remote_candidates[agent->remote_candidates_count], line_start, line_end) == 0) {
+            for (i = 0; i < agent->remote_candidates_count; i++) {
+                if (strcmp(agent->remote_candidates[i].foundation, agent->remote_candidates[agent->remote_candidates_count].foundation) == 0) {
+                    break;
+                }
+            }
+            if (i == agent->remote_candidates_count) {
+                agent->remote_candidates_count++;
+            }
         }
-        if (i == agent->remote_candidates_count) {
-          agent->remote_candidates_count++;
-        }
-      }
     }
 
     line_start = line_end + 2;

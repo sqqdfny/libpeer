@@ -81,7 +81,7 @@ int ice_candidate_from_description(IceCandidate* candidate, char* description, c
   char* candidate_start = description;
   uint32_t port;
   char type[16];
-  char addrstring[ADDRSTRLEN];
+  char addrstring[256]; // 局域网会使用 mDNS 主机名
 
   if (strncmp("a=", candidate_start, strlen("a=")) == 0) {
     candidate_start += strlen("a=");
@@ -89,6 +89,7 @@ int ice_candidate_from_description(IceCandidate* candidate, char* description, c
   candidate_start += strlen("candidate:");
 
   // a=candidate:448736988 1 udp 2122260223 172.17.0.1 49250 typ host generation 0 network-id 1 network-cost 50
+  // a=candidate:3989800143 1 udp 2113937151 48c82aba-d349-4784-a733-404f193524f5.local 64630 typ host generation 0 network-cost 999
   // a=candidate:udpcandidate 1 udp 120 192.168.1.102 8000 typ host
   if (sscanf(candidate_start, "%s %d %s %" PRIu32 " %s %" PRIu32 " typ %s",
              candidate->foundation,
@@ -120,7 +121,7 @@ int ice_candidate_from_description(IceCandidate* candidate, char* description, c
 
   addr_set_port(&candidate->addr, port);
 
-  if (strstr(addrstring, "local") != NULL) {
+  if (strstr(addrstring, ".local") != NULL) {
     if (mdns_resolve_addr(addrstring, &candidate->addr) == 0) {
       LOGW("Failed to resolve mDNS address");
       return -1;

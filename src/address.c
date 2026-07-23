@@ -49,7 +49,7 @@ int addr_from_string(const char* buf, Address* addr) {
 }
 
 int addr_to_string(const Address* addr, char* buf, size_t len) {
-  memset(buf, 0, sizeof(len));
+  memset(buf, 0, len);
   switch (addr->family) {
 #if CONFIG_USE_IPV6
     case AF_INET6:
