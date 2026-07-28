@@ -259,13 +259,18 @@ void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
         sack_chunk->a_rwnd = htonl(0x02);
         length = ntohs(sack_chunk->common.length) + sizeof(SctpHeader);
 
-        LOGD("SCTP_DATA. ppid = %ld, data = %.2x", ntohl(data_chunk->ppid), data_chunk->data[0]);
+        LOGD("SCTP_DATA. ppid = %ld, data = %.2x, sid = %u", ntohl(data_chunk->ppid), data_chunk->data[0], ntohs(data_chunk->sid));
         if (ntohl(data_chunk->ppid) == DATA_CHANNEL_PPID_CONTROL && data_chunk->data[0] == DATA_CHANNEL_OPEN) {
+          uint16_t browser_sid = ntohs(data_chunk->sid);
+          sctp->stream_count = 1;
+          sctp->stream_table[0].sid = browser_sid;
+          sctp->stream_table[0].label[0] = '0';
+          LOGD("DCEP OPEN from sid=%u, saving", browser_sid);
           data_chunk = (SctpDataChunk*)sack_chunk->blocks;
           data_chunk->type = SCTP_DATA;
           data_chunk->iube = 0x03;
           data_chunk->tsn = htonl(sctp->tsn++);
-          data_chunk->sid = htons(0);
+          data_chunk->sid = htons(browser_sid);
           data_chunk->sqn = htons(0);
           data_chunk->ppid = htonl(DATA_CHANNEL_PPID_CONTROL);
           data_chunk->length = htons(1 + sizeof(SctpDataChunk));

@@ -350,6 +350,26 @@ void agent_process_stun_request(Agent* agent, StunMessage* stun_msg, Address* ad
         agent_create_binding_response(agent, &msg, addr);
         agent_socket_send(agent, addr, msg.buf, msg.size);
         agent->binding_request_time = ports_get_epoch_time();
+
+        /**
+         * When there are no candidate pairs (e.g., the browser's mDNS hostname cannot be resolved),
+         * create a candidate pair from the UDP source address of the STUN request.
+         * Mark it as FROZEN; later, the standard ICE procedure will select the pair,
+         * send USE‑CANDIDATE, and establish connectivity.
+        */
+        if (agent->candidate_pairs_num == 0 && agent->local_candidates_count > 0) {
+          memcpy(&agent->remote_candidates[0].addr, addr, sizeof(Address));
+          agent->remote_candidates[0].type = ICE_CANDIDATE_TYPE_HOST;
+          agent->remote_candidates[0].addr.port = addr->port;
+          agent->remote_candidates_count = 1;
+          agent->candidate_pairs[0].local = &agent->local_candidates[0];
+          agent->candidate_pairs[0].remote = &agent->remote_candidates[0];
+          agent->candidate_pairs[0].state = ICE_CANDIDATE_STATE_FROZEN;
+          agent->candidate_pairs[0].priority = agent->local_candidates[0].priority;
+          agent->candidate_pairs[0].conncheck = 0;
+          agent->candidate_pairs_num = 1;
+          agent->nominated_pair = &agent->candidate_pairs[0];
+        }
       }
       break;
     default:
@@ -465,6 +485,15 @@ int agent_connectivity_check(Agent* agent) {
   char addr_string[ADDRSTRLEN];
   uint8_t buf[1400];
   StunMessage msg;
+
+  if (agent->nominated_pair == NULL) {
+    /**
+     * No candidate pairs yet (all mDNS attempts failed),
+     * only receive and process STUN requests actively sent by the browser.
+     */
+    agent_recv(agent, buf, sizeof(buf));
+    return -1;
+  }
 
   if (agent->nominated_pair->state != ICE_CANDIDATE_STATE_INPROGRESS) {
     LOGI("nominated pair is not in progress");

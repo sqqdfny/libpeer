@@ -122,7 +122,18 @@ int ice_candidate_from_description(IceCandidate* candidate, char* description, c
   addr_set_port(&candidate->addr, port);
 
   if (strstr(addrstring, ".local") != NULL) {
-    if (mdns_resolve_addr(addrstring, &candidate->addr) == 0) {
+    /**
+     * In a LAN environment, Chrome assigns a local domain name like uuid.local.
+     * If the device is a Wi‑Fi AP and the PC is directly connected via Wi‑Fi,
+     * while the PC's wired network interface is also connected to another network,
+     * an mDNS query will return the IP of the wired interface.
+     * In this case, mdns_resolve_addr() will have 3 retries × 5 receive attempts × 1s timeout
+     * = up to 15 seconds, and it will definitely fail.
+     */
+#if CONFIG_USE_MDNS
+    if (mdns_resolve_addr(addrstring, &candidate->addr) == 0)
+#endif
+    {
       LOGW("Failed to resolve mDNS address");
       return -1;
     }

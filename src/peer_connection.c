@@ -214,7 +214,12 @@ int peer_connection_send_video(PeerConnection* pc, const uint8_t* buf, size_t le
 }
 
 int peer_connection_datachannel_send(PeerConnection* pc, char* message, size_t len) {
-  return peer_connection_datachannel_send_sid(pc, message, len, 0);
+  /**
+   * Use the actual sid from the SCTP stream table (negotiated by the browser's DCEP OPEN),
+   * instead of hardcoding 0.
+   */
+  uint16_t sid = (pc->sctp.stream_count > 0) ? pc->sctp.stream_table[0].sid : 0;
+  return peer_connection_datachannel_send_sid(pc, message, len, sid);
 }
 
 int peer_connection_datachannel_send_sid(PeerConnection* pc, char* message, size_t len, uint16_t sid) {
@@ -295,7 +300,15 @@ int peer_connection_loop(PeerConnection* pc) {
 
     case PEER_CONNECTION_CHECKING:
       if (agent_select_candidate_pair(&pc->agent) < 0) {
-        STATE_CHANGED(pc, PEER_CONNECTION_FAILED);
+        /**
+         * No candidate pairs (browser's mDNS hostname cannot be resolved).
+         * Do not directly mark as FAILED; still receive STUN requests —
+         * agent_process_stun_request will create a FROZEN candidate pair from the UDP source address,
+         * and in the next loop iteration the standard procedure will select the pair,
+         * send USE‑CANDIDATE, and establish connectivity.
+         */
+        uint8_t buf[1400];
+        agent_recv(&pc->agent, buf, sizeof(buf));
       } else if (agent_connectivity_check(&pc->agent) == 0) {
         STATE_CHANGED(pc, PEER_CONNECTION_CONNECTED);
       }
