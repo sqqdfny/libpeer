@@ -45,6 +45,8 @@ struct PeerConnection {
 
   uint32_t remote_assrc;
   uint32_t remote_vssrc;
+
+  uint32_t handshake_start_time;
 };
 
 static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void* user_data) {
@@ -300,16 +302,31 @@ int peer_connection_loop(PeerConnection* pc) {
 
     case PEER_CONNECTION_CHECKING:
       if (agent_select_candidate_pair(&pc->agent) < 0) {
-        /**
-         * No candidate pairs (browser's mDNS hostname cannot be resolved).
-         * Do not directly mark as FAILED; still receive STUN requests —
-         * agent_process_stun_request will create a FROZEN candidate pair from the UDP source address,
-         * and in the next loop iteration the standard procedure will select the pair,
-         * send USE‑CANDIDATE, and establish connectivity.
-         */
-        uint8_t buf[1400];
-        agent_recv(&pc->agent, buf, sizeof(buf));
+        {
+            /**
+             * No candidate pairs (browser's mDNS hostname cannot be resolved).
+             * Do not directly mark as FAILED; still receive STUN requests —
+             * agent_process_stun_request will create a FROZEN candidate pair from the UDP source address,
+             * and in the next loop iteration the standard procedure will select the pair,
+             * send USE‑CANDIDATE, and establish connectivity.
+             */
+            uint8_t buf[1400];
+            agent_recv(&pc->agent, buf, sizeof(buf));
+        }
+        if (pc->agent.candidate_pairs_num == 0) {
+            /**
+             * No candidate pairs, wait for the browser to send STUN.
+             * A 15-second timeout prevents failure to exit the
+             * PEER_CONNECTION_CHECKING state after the browser disconnects.
+             */
+            if (pc->agent.binding_request_time == 0) {
+                pc->agent.binding_request_time = ports_get_epoch_time();
+            } else if ((ports_get_epoch_time() - pc->agent.binding_request_time) > CONFIG_CHECKING_TIMEOUT) {
+                STATE_CHANGED(pc, PEER_CONNECTION_FAILED);
+            }
+        }
       } else if (agent_connectivity_check(&pc->agent) == 0) {
+        pc->handshake_start_time = ports_get_epoch_time();
         STATE_CHANGED(pc, PEER_CONNECTION_CONNECTED);
       }
       break;
@@ -325,7 +342,17 @@ int peer_connection_loop(PeerConnection* pc) {
           pc->sctp.userdata = pc->config.user_data;
         }
 
+        /**
+         * Reset the keepalive base timestamp to prevent an
+         * immediate timeout upon entering PEER_CONNECTION_COMPLETED.
+         */
+        pc->agent.binding_request_time = ports_get_epoch_time();
         STATE_CHANGED(pc, PEER_CONNECTION_COMPLETED);
+      } else {
+        if ((ports_get_epoch_time() - pc->handshake_start_time) > CONFIG_DTLS_HANDSHAKE_TIMEOUT) {
+            LOGW("handshake timeout");
+            STATE_CHANGED(pc, PEER_CONNECTION_FAILED);
+        }
       }
       break;
     case PEER_CONNECTION_COMPLETED:
