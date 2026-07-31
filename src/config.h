@@ -7,6 +7,10 @@
 #define SCTP_MTU (1200)
 #define CONFIG_MTU (1300)
 
+// Advertised receiver window. Incoming DATA is dispatched to the user callback
+// immediately without buffering, so the window is always fully available.
+#define SCTP_LOCAL_RWND (0x100000)
+
 #ifndef CONFIG_USE_LWIP
 #define CONFIG_USE_LWIP 0
 #endif

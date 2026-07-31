@@ -19,6 +19,11 @@
     pc->state = curr_state;                                           \
   }
 
+// Max datagrams drained per peer_connection_loop() call. A single video frame
+// generates dozens of SACKs; draining one per call throttles the peer to the
+// loop period and overflows the UDP receive queue.
+#define PEER_CONNECTION_RECV_BURST 16
+
 struct PeerConnection {
   PeerConfiguration config;
   PeerConnectionState state;
@@ -356,7 +361,10 @@ int peer_connection_loop(PeerConnection* pc) {
       }
       break;
     case PEER_CONNECTION_COMPLETED:
-      if ((pc->agent_ret = agent_recv(&pc->agent, pc->agent_buf, sizeof(pc->agent_buf))) > 0) {
+      for (int i = 0; i < PEER_CONNECTION_RECV_BURST; i++) {
+        if ((pc->agent_ret = agent_recv(&pc->agent, pc->agent_buf, sizeof(pc->agent_buf))) <= 0) {
+          break;
+        }
         LOGD("agent_recv %d", pc->agent_ret);
 
         if (rtcp_probe(pc->agent_buf, pc->agent_ret)) {

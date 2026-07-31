@@ -246,6 +246,7 @@ void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
   memset(sctp->buf, 0, sizeof(sctp->buf));
   while ((4 * (pos + 3) / 4) < len) {
     chunk_common = (SctpChunkCommon*)(buf + pos);
+    length = 0;  // only branches that build a reply set it, otherwise nothing is sent
 
     switch (chunk_common->type) {
       case SCTP_DATA: {
@@ -256,7 +257,7 @@ void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
         sack_chunk->common.flags = 0x00;
         sack_chunk->common.length = htons(16);
         sack_chunk->cumulative_tsn_ack = data_chunk->tsn;
-        sack_chunk->a_rwnd = htonl(0x02);
+        sack_chunk->a_rwnd = htonl(SCTP_LOCAL_RWND);
         length = ntohs(sack_chunk->common.length) + sizeof(SctpHeader);
 
         LOGD("SCTP_DATA. ppid = %ld, data = %.2x, sid = %u", ntohl(data_chunk->ppid), data_chunk->data[0], ntohs(data_chunk->sid));
@@ -282,7 +283,6 @@ void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
                             sctp->userdata, ntohs(data_chunk->sid));
           }
         }
-        pos = len;  // Do not handle other msg
       } break;
       case SCTP_INIT: {
         LOGD("SCTP_INIT");
@@ -296,7 +296,7 @@ void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
         init_ack->common.flags = 0x00;
         init_ack->common.length = htons(20 + 8);
         init_ack->initiate_tag = htonl(0x12345678);
-        init_ack->a_rwnd = htonl(0x100000);
+        init_ack->a_rwnd = htonl(SCTP_LOCAL_RWND);
         init_ack->number_of_outbound_streams = 0xffff;
         init_ack->number_of_inbound_streams = 0xffff;
         init_ack->initial_tsn = htonl(sctp->tsn);
@@ -413,7 +413,14 @@ void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
       dtls_srtp_write(sctp->dtls_srtp, sctp->buf, length);
       // sctp_outgoing_data_cb(sctp, sctp->buf, SCTP_MTU, 0, 0);
     }
-    pos += ntohs(chunk_common->length);
+
+    if (pos < len) {
+      uint16_t chunk_len = ntohs(chunk_common->length);
+      if (chunk_len < sizeof(SctpChunkCommon)) {
+        break;  // malformed length would stall the loop
+      }
+      pos += 4 * ((chunk_len + 3) / 4);  // chunks are padded to a 4-byte boundary
+    }
   }
 #endif
 }
@@ -624,7 +631,7 @@ int sctp_create_association(Sctp* sctp, DtlsSrtp* dtls_srtp) {
   init_chunk->common.flags = 0x00;
   init_chunk->common.length = htons(20);
   init_chunk->initiate_tag = htonl(0x12345678);
-  init_chunk->a_rwnd = htonl(0x100000);
+  init_chunk->a_rwnd = htonl(SCTP_LOCAL_RWND);
   init_chunk->number_of_outbound_streams = 0xffff;
   init_chunk->number_of_inbound_streams = 0xffff;
   init_chunk->initial_tsn = htonl(sctp->tsn);
