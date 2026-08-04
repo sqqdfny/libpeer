@@ -437,6 +437,7 @@ void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp,
 
     if (strstr(buf, "a=fingerprint")) {
       strncpy(pc->dtls_srtp.remote_fingerprint, buf + 22, DTLS_SRTP_FINGERPRINT_LENGTH);
+      pc->dtls_srtp.remote_fingerprint[DTLS_SRTP_FINGERPRINT_LENGTH - 1] = '\0';
     }
 
     if (strstr(buf, "a=ice-ufrag") &&

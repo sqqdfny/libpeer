@@ -5,6 +5,10 @@
 #include "dtls_srtp.h"
 #include "utils.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef enum DecpMsgType {
 
   DATA_CHANNEL_OPEN = 0x03,
@@ -187,5 +191,9 @@ void sctp_onmessage(Sctp* sctp, void (*onmessage)(char* msg, size_t len, void* u
 void sctp_onopen(Sctp* sctp, void (*onopen)(void* userdata));
 
 void sctp_onclose(Sctp* sctp, void (*onclose)(void* userdata));
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif  // SCTP_H_
