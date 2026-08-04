@@ -171,6 +171,8 @@ PeerConnection* peer_connection_create(PeerConfiguration* config) {
 
   memset(&pc->sctp, 0, sizeof(pc->sctp));
 
+  pc->state = PEER_CONNECTION_NEW;
+
   if (pc->config.audio_codec) {
     rtp_encoder_init(&pc->artp_encoder, pc->config.audio_codec,
                      peer_connection_outgoing_rtp_packet, (void*)pc);
@@ -201,7 +203,7 @@ void peer_connection_destroy(PeerConnection* pc) {
 }
 
 void peer_connection_close(PeerConnection* pc) {
-  pc->state = PEER_CONNECTION_CLOSED;
+  STATE_CHANGED(pc, PEER_CONNECTION_CLOSED);
 }
 
 int peer_connection_send_audio(PeerConnection* pc, const uint8_t* buf, size_t len) {
@@ -395,6 +397,12 @@ int peer_connection_loop(PeerConnection* pc) {
         } else {
           LOGW("Unknown data");
         }
+      }
+
+      if (pc->config.datachannel && pc->sctp.association_failed) {
+        LOGI("SCTP association failed");
+        STATE_CHANGED(pc, PEER_CONNECTION_CLOSED);
+        break;
       }
 
       if (CONFIG_KEEPALIVE_TIMEOUT > 0 && (ports_get_epoch_time() - pc->agent.binding_request_time) > CONFIG_KEEPALIVE_TIMEOUT) {

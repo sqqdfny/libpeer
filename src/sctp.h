@@ -157,6 +157,7 @@ typedef struct Sctp {
   int local_port;
   int remote_port;
   int connected;
+  uint8_t association_failed;
   uint32_t verification_tag;
   uint32_t tsn;
   DtlsSrtp* dtls_srtp;

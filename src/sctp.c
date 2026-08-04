@@ -242,10 +242,15 @@ void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
     return;
   }
 
-  // prepare outgoing packet
-  memset(sctp->buf, 0, sizeof(sctp->buf));
-  while ((4 * (pos + 3) / 4) < len) {
+  while (pos + sizeof(SctpChunkCommon) <= len) {
+    memset(sctp->buf, 0, sizeof(sctp->buf));
     chunk_common = (SctpChunkCommon*)(buf + pos);
+
+    uint16_t chunk_len = ntohs(chunk_common->length);
+    if (chunk_len < sizeof(SctpChunkCommon) || pos + chunk_len > len) {
+      break;
+    }
+
     length = 0;  // only branches that build a reply set it, otherwise nothing is sent
 
     switch (chunk_common->type) {
@@ -328,10 +333,12 @@ void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
 
         cookie_echo->common.type = SCTP_COOKIE_ECHO;
         cookie_echo->common.flags = 0x00;
-        // cookie echo: type + flag + length (4 bytes) + cookie
-        cookie_echo->common.length = htons(ntohs(param->length));
-        // param: type + length (4 bytes) + cookie
-        memcpy(cookie_echo->cookie, param->value, ntohs(param->length) - 4);
+        if(param) {
+            // cookie echo: type + flag + length (4 bytes) + cookie
+            cookie_echo->common.length = htons(ntohs(param->length));
+            // param: type + length (4 bytes) + cookie
+            memcpy(cookie_echo->cookie, param->value, ntohs(param->length) - 4);
+        }
         length = ntohs(cookie_echo->common.length) + sizeof(SctpHeader);
       } break;
       case SCTP_SACK:
@@ -389,8 +396,70 @@ void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
         }
         break;
       }
+      case SCTP_HEARTBEAT: {
+        if (chunk_len <= sizeof(sctp->buf)) {
+          SctpChunkCommon* hb_ack = (SctpChunkCommon*)out_packet->chunks;
+          memcpy(hb_ack, chunk_common, chunk_len);
+          hb_ack->type = SCTP_HEARTBEAT_ACK;
+          length = chunk_len + sizeof(SctpHeader);
+        }
+      } break;
+      case SCTP_HEARTBEAT_ACK:
+        break;
+      case SCTP_SHUTDOWN: {
+        SctpChunkCommon* shut_ack = (SctpChunkCommon*)out_packet->chunks;
+        shut_ack->type = SCTP_SHUTDOWN_ACK;
+        shut_ack->flags = 0x00;
+        shut_ack->length = htons(4);
+        length = sizeof(SctpHeader) + sizeof(SctpChunkCommon);
+        sctp->connected = 0;
+        sctp->association_failed = 1;
+        if (sctp->onclose) {
+          sctp->onclose(sctp->userdata);
+        }
+      } break;
+      case SCTP_SHUTDOWN_ACK: {
+        SctpChunkCommon* shut_comp = (SctpChunkCommon*)out_packet->chunks;
+        shut_comp->type = SCTP_SHUTDOWN_COMPLETE;
+        shut_comp->flags = 0x00;
+        shut_comp->length = htons(4);
+        length = sizeof(SctpHeader) + sizeof(SctpChunkCommon);
+        sctp->connected = 0;
+        sctp->association_failed = 1;
+        if (sctp->onclose) {
+          sctp->onclose(sctp->userdata);
+        }
+      } break;
+      case SCTP_SHUTDOWN_COMPLETE:
+        sctp->connected = 0;
+        sctp->association_failed = 1;
+        if (sctp->onclose) {
+          sctp->onclose(sctp->userdata);
+        }
+        break;
+      case SCTP_ERROR: {
+        if (chunk_len > sizeof(SctpChunkCommon)) {
+          size_t cause_pos = pos + sizeof(SctpChunkCommon);
+          size_t cause_end = pos + chunk_len;
+          while (cause_pos + 4 <= cause_end) {
+            uint16_t cause_code = ntohs(*(uint16_t*)(buf + cause_pos));
+            uint16_t cause_length = ntohs(*(uint16_t*)(buf + cause_pos + 2));
+            if (cause_length < 4 || cause_pos + cause_length > cause_end) break;
+            LOGW("SCTP_ERROR cause_code=0x%04x", cause_code);
+            cause_pos += ((cause_length + 3) / 4) * 4;
+          }
+        }
+      } break;
+      case SCTP_FORWARD_TSN: {
+        SctpForwardTsnChunk* fwd = (SctpForwardTsnChunk*)(buf + pos);
+        uint32_t new_cumulative_tsn = ntohl(fwd->new_cumulative_tsn);
+        if (new_cumulative_tsn >= sctp->tsn) {
+          sctp->tsn = new_cumulative_tsn + 1;
+        }
+      } break;
       case SCTP_ABORT:
         sctp->connected = 0;
+        sctp->association_failed = 1;
         if (sctp->onclose) {
           sctp->onclose(sctp->userdata);
         }
@@ -414,13 +483,7 @@ void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
       // sctp_outgoing_data_cb(sctp, sctp->buf, SCTP_MTU, 0, 0);
     }
 
-    if (pos < len) {
-      uint16_t chunk_len = ntohs(chunk_common->length);
-      if (chunk_len < sizeof(SctpChunkCommon)) {
-        break;  // malformed length would stall the loop
-      }
-      pos += 4 * ((chunk_len + 3) / 4);  // chunks are padded to a 4-byte boundary
-    }
+    pos += ((chunk_len + 3) / 4) * 4;  // chunks are padded to a 4-byte boundary
   }
 #endif
 }
@@ -617,6 +680,9 @@ int sctp_create_association(Sctp* sctp, DtlsSrtp* dtls_srtp) {
   sctp->sock = sock;
 #else
   // send SCTP_INIT
+  sctp->connected = 0;
+  sctp->association_failed = 0;
+
   int length = 0;
   SctpInitChunk* init_chunk;
   SctpHeader* header;
