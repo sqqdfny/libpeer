@@ -369,6 +369,50 @@ void agent_process_stun_request(Agent* agent, StunMessage* stun_msg, Address* ad
           agent->candidate_pairs[0].conncheck = 0;
           agent->candidate_pairs_num = 1;
           agent->nominated_pair = &agent->candidate_pairs[0];
+        } else {
+          int found = 0;
+
+          /* Phase A: match source address to existing remote candidates */
+          for (int i = 0; i < agent->candidate_pairs_num; i++) {
+            if (addr_equal(&agent->candidate_pairs[i].remote->addr, addr)) {
+              agent->candidate_pairs[i].state = ICE_CANDIDATE_STATE_SUCCEEDED;
+              agent->nominated_pair = &agent->candidate_pairs[i];
+              agent->selected_pair  = &agent->candidate_pairs[i];
+              LOGD("ICE pair %d SUCCEEDED via inbound STUN request", i);
+              found = 1;
+              break;
+            }
+          }
+
+          /* Phase B: source differs from SDP — create peer-reflexive candidate */
+          if (!found
+              && agent->remote_candidates_count < AGENT_MAX_CANDIDATES
+              && agent->local_candidates_count > 0) {
+            IceCandidate *prflx =
+                &agent->remote_candidates[agent->remote_candidates_count];
+            ice_candidate_create(prflx, agent->remote_candidates_count,
+                                 ICE_CANDIDATE_TYPE_PRFLX, addr);
+            agent->remote_candidates_count++;
+
+            for (int j = 0; j < agent->local_candidates_count; j++) {
+              if (agent->local_candidates[j].addr.family == addr->family
+                  && agent->candidate_pairs_num < AGENT_MAX_CANDIDATE_PAIRS) {
+                int idx = agent->candidate_pairs_num;
+                agent->candidate_pairs[idx].local  = &agent->local_candidates[j];
+                agent->candidate_pairs[idx].remote = prflx;
+                agent->candidate_pairs[idx].priority =
+                    agent->local_candidates[j].priority + prflx->priority;
+                agent->candidate_pairs[idx].state = ICE_CANDIDATE_STATE_SUCCEEDED;
+                agent->candidate_pairs[idx].conncheck = 0;
+                agent->nominated_pair = &agent->candidate_pairs[idx];
+                agent->selected_pair  = &agent->candidate_pairs[idx];
+                agent->candidate_pairs_num++;
+                LOGI("ICE: created PRFLX candidate pair from inbound STUN");
+                found = 1;
+                break;
+              }
+            }
+          }
         }
       }
       break;
@@ -493,6 +537,12 @@ int agent_connectivity_check(Agent* agent) {
      */
     agent_recv(agent, buf, sizeof(buf));
     return -1;
+  }
+
+  /* Handle pair already marked SUCCEEDED by agent_process_stun_request */
+  if (agent->nominated_pair->state == ICE_CANDIDATE_STATE_SUCCEEDED) {
+    agent->selected_pair = agent->nominated_pair;
+    return 0;
   }
 
   if (agent->nominated_pair->state != ICE_CANDIDATE_STATE_INPROGRESS) {

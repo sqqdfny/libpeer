@@ -63,6 +63,19 @@ int addr_to_string(const Address* addr, char* buf, size_t len) {
 }
 
 int addr_equal(const Address* a, const Address* b) {
-  // TODO
-  return 1;
+  if (!a || !b) return 0;
+  if (a->family != b->family) return 0;
+  if (a->port != b->port) return 0;
+
+  switch (a->family) {
+    case AF_INET:
+      return a->sin.sin_addr.s_addr == b->sin.sin_addr.s_addr;
+#if CONFIG_USE_IPV6
+    case AF_INET6:
+      return memcmp(&a->sin6.sin6_addr, &b->sin6.sin6_addr,
+                    sizeof(struct in6_addr)) == 0;
+#endif
+    default:
+      return 0;
+  }
 }
