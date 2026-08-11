@@ -480,8 +480,8 @@ void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp,
 }
 
 static const char* peer_connection_create_sdp(PeerConnection* pc, SdpType sdp_type) {
+  uint8_t create_candidate_sdp_flag = 0;
   char* description = (char*)pc->temp_buf;
-
   memset(pc->temp_buf, 0, sizeof(pc->temp_buf));
   DtlsSrtpRole role = DTLS_SRTP_ROLE_SERVER;
 
@@ -519,27 +519,13 @@ static const char* peer_connection_create_sdp(PeerConnection* pc, SdpType sdp_ty
   sdp_append(pc->sdp, "a=fingerprint:sha-256 %s", pc->dtls_srtp.local_fingerprint);
   sdp_append(pc->sdp, peer_connection_dtls_role_setup_value(role));
 
-  if (pc->config.video_codec == CODEC_H264) {
-    sdp_append_h264(pc->sdp);
-  }
-
-  switch (pc->config.audio_codec) {
-    case CODEC_PCMA:
-      sdp_append_pcma(pc->sdp);
-      break;
-    case CODEC_PCMU:
-      sdp_append_pcmu(pc->sdp);
-      break;
-    case CODEC_OPUS:
-      sdp_append_opus(pc->sdp);
-    default:
-      break;
-  }
-
-  if (pc->config.datachannel) {
-    sdp_append_datachannel(pc->sdp);
-  }
-
+  /* 虽然从 RFC 8840 (SDP for BUNDLE) 和 RFC 5245 (ICE) 的标准来看，Session-level candidate 在语法上是合法的，
+   * 但在实际的 WebRTC 工程实践中，Media-level candidate 的兼容性和成功率远高于 Session-level。
+   * starfan 20260811: 上面两行为网上查找的结论，下面为实测的结果。
+   * a=candidate 必须放在第一个 m= 段段之后作为
+   * 否则 Chrome 在 第一个 m= 段 段找不到 candidate 会一直等
+   * trickle ICE，从不发起 connectivity check（不发 STUN，也不回 STUN）。
+   */
   pc->b_local_description_created = 1;
 
   agent_gather_candidate(&pc->agent, NULL, NULL, NULL);  // host address
@@ -551,7 +537,48 @@ static const char* peer_connection_create_sdp(PeerConnection* pc, SdpType sdp_ty
   }
 
   agent_get_local_description(&pc->agent, description, sizeof(pc->temp_buf));
-  sdp_append(pc->sdp, description);
+
+  if (pc->config.video_codec == CODEC_H264) {
+    sdp_append_h264(pc->sdp);
+    if(0 == create_candidate_sdp_flag) {
+        create_candidate_sdp_flag = 1;
+        sdp_append(pc->sdp, description);
+    }
+  }
+
+  switch (pc->config.audio_codec) {
+    case CODEC_PCMA:
+      sdp_append_pcma(pc->sdp);
+      if(0 == create_candidate_sdp_flag) {
+        create_candidate_sdp_flag = 1;
+        sdp_append(pc->sdp, description);
+      }
+      break;
+    case CODEC_PCMU:
+      sdp_append_pcmu(pc->sdp);
+      if(0 == create_candidate_sdp_flag) {
+        create_candidate_sdp_flag = 1;
+        sdp_append(pc->sdp, description);
+      }
+      break;
+    case CODEC_OPUS:
+      sdp_append_opus(pc->sdp);
+      if(0 == create_candidate_sdp_flag) {
+        create_candidate_sdp_flag = 1;
+        sdp_append(pc->sdp, description);
+      }
+    default:
+      break;
+  }
+
+  if (pc->config.datachannel) {
+    sdp_append_datachannel(pc->sdp);
+  }
+
+  if(0 == create_candidate_sdp_flag) {
+    create_candidate_sdp_flag = 1;
+    sdp_append(pc->sdp, description);
+  }
 
   if (pc->onicecandidate) {
     pc->onicecandidate(pc->sdp, pc->config.user_data);
