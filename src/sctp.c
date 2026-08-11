@@ -124,7 +124,7 @@ int sctp_outgoing_data(Sctp* sctp, char* buf, size_t len, SctpDataPpid ppid, uin
 
   chunk->type = SCTP_DATA;
   chunk->iube = 0x06;
-  chunk->sid = htons(0);
+  chunk->sid = htons(sid);
   chunk->sqn = htons(sqn++);
   chunk->ppid = htonl(ppid);
 
@@ -283,6 +283,21 @@ void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
           data_chunk->data[0] = DATA_CHANNEL_ACK;
           length += ntohs(data_chunk->length);
         } else if (ntohl(data_chunk->ppid) == DATA_CHANNEL_PPID_DOMSTRING || ntohl(data_chunk->ppid) == DATA_CHANNEL_PPID_BINARY) {
+          /* Send SACK BEFORE calling onmessage — onmessage may invoke
+           * sctp_outgoing_data() which overwrites sctp->buf, corrupting the
+           * SACK.  If the peer never sees a valid SACK it retransmits the
+           * payload, creating an infinite ping-pong loop. */
+          out_packet->header.source_port = htons(sctp->local_port);
+          out_packet->header.destination_port = htons(sctp->remote_port);
+          out_packet->header.verification_tag = sctp->verification_tag;
+          out_packet->header.checksum = 0x00;
+          {
+            size_t sack_len = (4 * ((length + 3) / 4));
+            out_packet->header.checksum = sctp_get_checksum(sctp, sctp->buf, sack_len);
+            dtls_srtp_write(sctp->dtls_srtp, sctp->buf, sack_len);
+          }
+          length = 0;  /* SACK sent; don't resend below */
+
           if (sctp->onmessage) {
             sctp->onmessage((char*)data_chunk->data, ntohs(data_chunk->length) - sizeof(SctpDataChunk),
                             sctp->userdata, ntohs(data_chunk->sid));
