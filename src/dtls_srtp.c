@@ -222,6 +222,9 @@ int dtls_srtp_init(DtlsSrtp* dtls_srtp, DtlsSrtpRole role, void* user_data) {
 
   mbedtls_ssl_setup(&dtls_srtp->ssl, &dtls_srtp->conf);
 
+  dtls_srtp->srtp_in = NULL;
+  dtls_srtp->srtp_out = NULL;
+
   return 0;
 }
 
@@ -310,7 +313,7 @@ static int dtls_srtp_key_derivation(DtlsSrtp* dtls_srtp, const unsigned char* ma
   dtls_srtp->remote_policy.next = NULL;
 
   if (srtp_create(&dtls_srtp->srtp_in, &dtls_srtp->remote_policy) != srtp_err_status_ok) {
-    LOGD("Error creating inbound SRTP session for component");
+    LOGE("Error creating inbound SRTP session for component");
     return -1;
   }
 
@@ -477,6 +480,8 @@ void dtls_srtp_reset_session(DtlsSrtp* dtls_srtp) {
   if (dtls_srtp->state == DTLS_SRTP_STATE_CONNECTED) {
     srtp_dealloc(dtls_srtp->srtp_in);
     srtp_dealloc(dtls_srtp->srtp_out);
+    dtls_srtp->srtp_in = NULL;
+    dtls_srtp->srtp_out = NULL;
     mbedtls_ssl_session_reset(&dtls_srtp->ssl);
   }
 
@@ -516,17 +521,25 @@ int dtls_srtp_probe(uint8_t* buf) {
 }
 
 void dtls_srtp_decrypt_rtp_packet(DtlsSrtp* dtls_srtp, uint8_t* packet, int* bytes) {
-  srtp_unprotect(dtls_srtp->srtp_in, packet, bytes);
+  if (dtls_srtp->srtp_in) {
+    srtp_unprotect(dtls_srtp->srtp_in, packet, bytes);
+  }
 }
 
 void dtls_srtp_decrypt_rtcp_packet(DtlsSrtp* dtls_srtp, uint8_t* packet, int* bytes) {
-  srtp_unprotect_rtcp(dtls_srtp->srtp_in, packet, bytes);
+  if (dtls_srtp->srtp_in) {
+    srtp_unprotect_rtcp(dtls_srtp->srtp_in, packet, bytes);
+  }
 }
 
 void dtls_srtp_encrypt_rtp_packet(DtlsSrtp* dtls_srtp, uint8_t* packet, int* bytes) {
-  srtp_protect(dtls_srtp->srtp_out, packet, bytes);
+  if (dtls_srtp->srtp_out) {
+    srtp_protect(dtls_srtp->srtp_out, packet, bytes);
+  }
 }
 
 void dtls_srtp_encrypt_rctp_packet(DtlsSrtp* dtls_srtp, uint8_t* packet, int* bytes) {
-  srtp_protect_rtcp(dtls_srtp->srtp_out, packet, bytes);
+  if (dtls_srtp->srtp_out) {
+    srtp_protect_rtcp(dtls_srtp->srtp_out, packet, bytes);
+  }
 }

@@ -343,6 +343,12 @@ int peer_connection_loop(PeerConnection* pc) {
       if (dtls_srtp_handshake(&pc->dtls_srtp, NULL) == 0) {
         LOGD("DTLS-SRTP handshake done");
 
+        if (pc->dtls_srtp.state != DTLS_SRTP_STATE_CONNECTED) {
+          LOGW("DTLS-SRTP key derivation failed");
+          STATE_CHANGED(pc, PEER_CONNECTION_FAILED);
+          break;
+        }
+
         if (pc->config.datachannel) {
           LOGI("SCTP create socket");
           sctp_create_association(&pc->sctp, &pc->dtls_srtp);
