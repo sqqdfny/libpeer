@@ -222,6 +222,10 @@ int peer_connection_send_video(PeerConnection* pc, const uint8_t* buf, size_t le
   return rtp_encoder_encode(&pc->vrtp_encoder, buf, len);
 }
 
+void peer_connection_set_video_timestamp_increment(PeerConnection* pc, uint32_t increment) {
+  rtp_encoder_set_timestamp_increment(&pc->vrtp_encoder, increment);
+}
+
 int peer_connection_datachannel_send(PeerConnection* pc, char* message, size_t len) {
   /**
    * Use the actual sid from the SCTP stream table (negotiated by the browser's DCEP OPEN),

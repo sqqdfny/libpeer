@@ -13,7 +13,7 @@
 #include <mbedtls/x509_crt.h>
 #include <mbedtls/x509_csr.h>
 
-#include <srtp2/srtp.h>
+#include <srtp.h>
 
 #include "address.h"
 

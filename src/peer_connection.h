@@ -117,6 +117,9 @@ int peer_connection_send_audio(PeerConnection* pc, const uint8_t* packet, size_t
 
 int peer_connection_send_video(PeerConnection* pc, const uint8_t* packet, size_t bytes);
 
+// 按实际视频帧间隔调整媒体时钟步进（90kHz 单位）
+void peer_connection_set_video_timestamp_increment(PeerConnection* pc, uint32_t increment);
+
 void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp, SdpType sdp_type);
 
 void peer_connection_set_local_description(PeerConnection* pc, const char* sdp, SdpType sdp_type);
