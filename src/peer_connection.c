@@ -24,6 +24,22 @@
 // loop period and overflows the UDP receive queue.
 #define PEER_CONNECTION_RECV_BURST 16
 
+// ================= NACK 重传缓存 (RFC 4585 generic NACK) =================
+// 只缓存"加密后"的 RTP 包原样重发：明文重加密会被 libsrtp 发送侧 rdbx 以
+// pkt_idx_old 拒绝，且同 key+index 重加密违反 SRTP 使用规范；重传包保持原
+// seq/ts/ssrc/auth-tag，接收侧重放窗口对真丢失包放行、对竞态重复包丢弃。
+// Ring 为 struct PeerConnection 末尾的柔性数组，槽位数运行时由
+// config.nack_ring_packets 决定：0 = 禁用 (不缓存、不重传、不占内存)，
+// 非 0 必须为 2 的幂 (peer_connection_create 校验，非法直接失败)。
+
+#define PEER_CONNECTION_NACK_SLOT_SIZE (CONFIG_MTU + 16) /* 密文 + SRTP auth tag(10B) 余量 */
+
+typedef struct {
+  uint16_t seq;
+  uint16_t len;                                /* len==0 视为空槽 */
+  uint8_t data[PEER_CONNECTION_NACK_SLOT_SIZE];
+} nack_ring_entry_t;
+
 struct PeerConnection {
   PeerConfiguration config;
   PeerConnectionState state;
@@ -52,11 +68,27 @@ struct PeerConnection {
   uint32_t remote_vssrc;
 
   uint32_t handshake_start_time;
+
+  uint32_t nack_retransmits; /* NACK 重传包计数 (config.nack_ring_packets==0 时恒 0) */
+
+  /* 柔性数组 (GCC 零长数组扩展, 仓库既有写法, 见 async_delegation.c):
+   * NACK 重传 ring, 槽位数 = config.nack_ring_packets (0 时分配 0 字节),
+   * 必须是 struct 最后一个成员, 随 create 一次性 calloc 分配。 */
+  nack_ring_entry_t nack_ring[0];
 };
 
 static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void* user_data) {
   PeerConnection* pc = (PeerConnection*)user_data;
   dtls_srtp_encrypt_rtp_packet(&pc->dtls_srtp, data, (int*)&size);
+  /* 缓存密文(含 auth tag)供 NACK 原样重发；只缓存视频轨 */
+  if (pc->config.nack_ring_packets > 0 && (data[1] & 0x7F) == PT_H264 &&
+      size <= PEER_CONNECTION_NACK_SLOT_SIZE) {
+    uint16_t seq = ((uint16_t)data[2] << 8) | data[3];
+    nack_ring_entry_t* e = &pc->nack_ring[seq & (pc->config.nack_ring_packets - 1)];
+    e->seq = seq;
+    e->len = (uint16_t)size;
+    memcpy(e->data, data, size);
+  }
   agent_send(&pc->agent, data, size);
 }
 
@@ -91,6 +123,19 @@ static int peer_connection_dtls_srtp_send(void* ctx, const uint8_t* buf, size_t 
   return agent_send(&pc->agent, buf, len);
 }
 
+static void peer_connection_nack_retransmit(PeerConnection* pc, uint16_t seq) {
+  /* nack_ring_packets==0 (未启用重传) 早退 */
+  if (pc->config.nack_ring_packets == 0) {
+    return;
+  }
+  /* 同余槽位校验: seq 超出窗口时槽位内容必不匹配, 天然实现窗口语义 */
+  nack_ring_entry_t* e = &pc->nack_ring[seq & (pc->config.nack_ring_packets - 1)];
+  if (e->seq == seq && e->len > 0) {
+    agent_send(&pc->agent, e->data, e->len);
+    pc->nack_retransmits++;
+  }
+}
+
 static void peer_connection_incoming_rtcp(PeerConnection* pc, uint8_t* buf, size_t len) {
   RtcpHeader* rtcp_header;
   size_t pos = 0;
@@ -121,6 +166,30 @@ static void peer_connection_incoming_rtcp(PeerConnection* pc, uint8_t* buf, size
         if ((fmt == 1 || fmt == 4) && pc->config.on_request_keyframe) {
           pc->config.on_request_keyframe(pc->config.user_data);
         }
+        break;
+      }
+      case RTCP_RTPFB: {
+        int fmt = rtcp_header->rc;
+        LOGD("RTCP_RTPFB %d", fmt);
+        /* RFC 4585 generic NACK (fmt=1): FCI = PID(2B) + BLP(2B),
+         * 位于 pos+12 (RtcpHeader 4B + sender SSRC 4B + media SSRC 4B) */
+        if (fmt == 1 && pos + 16 <= len) {
+          const uint8_t* fci = buf + pos + 12;
+          uint32_t media = ((uint32_t)buf[pos + 8] << 24) | ((uint32_t)buf[pos + 9] << 16) |
+                           ((uint32_t)buf[pos + 10] << 8) | buf[pos + 11];
+          /* 只响应视频轨的 NACK: media SSRC == 本地视频 SSRC */
+          if (media == pc->vrtp_encoder.ssrc) {
+            uint16_t base = ((uint16_t)fci[0] << 8) | fci[1];
+            uint16_t blp = ((uint16_t)fci[2] << 8) | fci[3];
+            peer_connection_nack_retransmit(pc, base);
+            for (int i = 0; i < 16; i++) {
+              if (blp & (1u << i)) {
+                peer_connection_nack_retransmit(pc, (uint16_t)(base + i + 1));
+              }
+            }
+          }
+        }
+        break;
       }
       default:
         break;
@@ -155,12 +224,30 @@ PeerConnectionState peer_connection_get_state(PeerConnection* pc) {
   return pc->state;
 }
 
+uint32_t peer_connection_get_nack_retransmits(PeerConnection* pc) {
+  return pc->nack_retransmits;
+}
+
 void* peer_connection_get_sctp(PeerConnection* pc) {
   return &pc->sctp;
 }
 
 PeerConnection* peer_connection_create(PeerConfiguration* config) {
-  PeerConnection* pc = calloc(1, sizeof(PeerConnection));
+  uint32_t n = config->nack_ring_packets;
+
+  /* n=0 合法(禁用重传); 非 0 必须为 2 的幂 —— n & (n-1) 对 n=0 也为 0 */
+  if (n & (n - 1)) {
+    LOGE("nack_ring_packets must be a power of 2 (got %" PRIu32 ")", n);
+    return NULL;
+  }
+  /* RV32 下 size_t 为 32 位: n=2^30 时 1320*n 精确回绕为 0,
+   * calloc 会成功而 ring 越界写, 必须守卫 */
+  if ((size_t)n > SIZE_MAX / sizeof(nack_ring_entry_t)) {
+    LOGE("nack_ring_packets too large (got %" PRIu32 ")", n);
+    return NULL;
+  }
+
+  PeerConnection* pc = calloc(1, sizeof(PeerConnection) + (size_t)n * sizeof(nack_ring_entry_t));
   if (!pc) {
     return NULL;
   }
