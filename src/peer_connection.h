@@ -126,6 +126,9 @@ void peer_connection_set_video_timestamp_increment(PeerConnection* pc, uint32_t 
 // NACK 重传统计 (config.nack_ring_packets==0 禁用时恒为 0)
 uint32_t peer_connection_get_nack_retransmits(PeerConnection* pc);
 
+// SRTP/SRTCP 入向鉴权失败丢包计数
+uint32_t peer_connection_get_srtp_auth_failures(PeerConnection* pc);
+
 void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp, SdpType sdp_type);
 
 void peer_connection_set_local_description(PeerConnection* pc, const char* sdp, SdpType sdp_type);

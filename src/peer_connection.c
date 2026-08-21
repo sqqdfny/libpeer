@@ -32,7 +32,7 @@
 // config.nack_ring_packets 决定：0 = 禁用 (不缓存、不重传、不占内存)，
 // 非 0 必须为 2 的幂 (peer_connection_create 校验，非法直接失败)。
 
-#define PEER_CONNECTION_NACK_SLOT_SIZE (CONFIG_MTU + 16) /* 密文 + SRTP auth tag(10B) 余量 */
+#define PEER_CONNECTION_NACK_SLOT_SIZE (CONFIG_MTU + 16) /* 密文 + SRTP auth tag 余量：GCM 16B tag 下满长包(1300+16)恰好容纳 */
 
 typedef struct {
   uint16_t seq;
@@ -70,6 +70,7 @@ struct PeerConnection {
   uint32_t handshake_start_time;
 
   uint32_t nack_retransmits; /* NACK 重传包计数 (config.nack_ring_packets==0 时恒 0) */
+  uint32_t srtp_auth_failures; /* SRTP/SRTCP 入向鉴权失败丢包计数 */
 
   /* 柔性数组 (GCC 零长数组扩展, 仓库既有写法, 见 async_delegation.c):
    * NACK 重传 ring, 槽位数 = config.nack_ring_packets (0 时分配 0 字节),
@@ -79,7 +80,11 @@ struct PeerConnection {
 
 static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void* user_data) {
   PeerConnection* pc = (PeerConnection*)user_data;
-  dtls_srtp_encrypt_rtp_packet(&pc->dtls_srtp, data, (int*)&size);
+  if (dtls_srtp_encrypt_rtp_packet(&pc->dtls_srtp, data, (int*)&size) != 0) {
+    /* 加密失败不发送：对端必然鉴权丢弃，缓存与发送都无意义 */
+    LOGW("srtp_protect failed, drop outbound RTP");
+    return;
+  }
   /* 缓存密文(含 auth tag)供 NACK 原样重发；只缓存视频轨 */
   if (pc->config.nack_ring_packets > 0 && (data[1] & 0x7F) == PT_H264 &&
       size <= PEER_CONNECTION_NACK_SLOT_SIZE) {
@@ -226,6 +231,10 @@ PeerConnectionState peer_connection_get_state(PeerConnection* pc) {
 
 uint32_t peer_connection_get_nack_retransmits(PeerConnection* pc) {
   return pc->nack_retransmits;
+}
+
+uint32_t peer_connection_get_srtp_auth_failures(PeerConnection* pc) {
+  return pc->srtp_auth_failures;
 }
 
 void* peer_connection_get_sctp(PeerConnection* pc) {
@@ -468,7 +477,12 @@ int peer_connection_loop(PeerConnection* pc) {
 
         if (rtcp_probe(pc->agent_buf, pc->agent_ret)) {
           LOGD("Got RTCP packet");
-          dtls_srtp_decrypt_rtcp_packet(&pc->dtls_srtp, pc->agent_buf, &pc->agent_ret);
+          if (dtls_srtp_decrypt_rtcp_packet(&pc->dtls_srtp, pc->agent_buf, &pc->agent_ret) != 0) {
+            /* 鉴权失败丢弃：AEAD/HMAC 未过校验的字节不得进入解析（防伪造反馈注入） */
+            LOGW("SRTCP auth failed, drop");
+            pc->srtp_auth_failures++;
+            continue;
+          }
           peer_connection_incoming_rtcp(pc, pc->agent_buf, pc->agent_ret);
 
         } else if (dtls_srtp_probe(pc->agent_buf)) {
@@ -482,7 +496,12 @@ int peer_connection_loop(PeerConnection* pc) {
         } else if (rtp_packet_validate(pc->agent_buf, pc->agent_ret)) {
           LOGD("Got RTP packet");
 
-          dtls_srtp_decrypt_rtp_packet(&pc->dtls_srtp, pc->agent_buf, &pc->agent_ret);
+          if (dtls_srtp_decrypt_rtp_packet(&pc->dtls_srtp, pc->agent_buf, &pc->agent_ret) != 0) {
+            /* 鉴权失败丢弃，绝不送解码器；缺口由 NACK 重传/PLI 关键帧恢复 */
+            LOGW("SRTP auth failed, drop");
+            pc->srtp_auth_failures++;
+            continue;
+          }
 
           ssrc = rtp_get_ssrc(pc->agent_buf);
           if (ssrc == pc->remote_assrc) {
