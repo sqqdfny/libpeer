@@ -86,6 +86,334 @@ static uint32_t sctp_get_checksum(Sctp* sctp, const uint8_t* buf, size_t len) {
   return crc;
 }
 
+
+#if !CONFIG_USE_USRSCTP
+/* 固定协商模式：RFC 9260 + RFC 3758 的单路径、单 DATA、无序零重传子集。
+ * 仅保存 TSN 元数据，不保存应用消息，不创建任务；由所属 PC 循环推进。 */
+#include "ports.h"
+static uint16_t sc16(const uint8_t* p) { return ((uint16_t)p[0] << 8) | p[1]; }
+static uint32_t sc32(const uint8_t* p) { return ((uint32_t)sc16(p) << 16) | sc16(p + 2); }
+static void sc_put16(uint8_t* p, uint16_t v) { p[0] = v >> 8; p[1] = v; }
+static void sc_put32(uint8_t* p, uint32_t v) { sc_put16(p, v >> 16); sc_put16(p + 2, v); }
+static int sc_after(uint32_t a, uint32_t b) { return (int32_t)(a - b) > 0; }
+static void sc_close(Sctp* s) {
+  int was_open = s->connected;
+  s->connected = 0;
+  s->phase = 0;
+  s->forward_pending = 0;
+  s->handshake_len = 0;
+  memset(s->tx, 0, sizeof(s->tx));
+  if (was_open && s->onclose) s->onclose(s->userdata);
+}
+static int sc_packet(Sctp* s, size_t chunk_len, uint32_t tag) {
+  size_t len = 12 + ((chunk_len + 3) & ~3u);
+  uint32_t crc;
+  sc_put16(s->buf, s->local_port);
+  sc_put16(s->buf + 2, s->remote_port);
+  sc_put32(s->buf + 4, tag);
+  memset(s->buf + 8, 0, 4);
+  memset(s->buf + 12 + chunk_len, 0, len - 12 - chunk_len);
+  crc = crc32c(0xffffffff, s->buf, len);
+  /* RFC 9260 附录 A：CRC 字节顺序与其余网络序字段不同。 */
+  for (int i = 0; i < 4; i++) s->buf[8 + i] = crc >> (8 * i);
+  return dtls_srtp_write(s->dtls_srtp, s->buf, len);
+}
+static void sc_common(Sctp* s, uint8_t type, uint16_t len) {
+  s->buf[12] = type; s->buf[13] = 0; sc_put16(s->buf + 14, len);
+}
+static void sc_save_handshake(Sctp* s, size_t len) {
+  s->handshake_len = len;
+  memcpy(s->handshake, s->buf, len);
+  s->timer_at = ports_get_monotonic_time();
+  s->retries = 0;
+}
+static void sc_open(Sctp* s) {
+  if (s->connected) return;
+  for (int i = 0; i < s->stream_count; i++) {
+    if (s->stream_table[i].sid >= s->peer_streams) {
+      s->association_failed = 1; sc_close(s); return;
+    }
+  }
+  s->phase = 3; s->connected = 1; s->handshake_len = 0; s->retries = 0; s->rto = 1000;
+  if (s->onopen) s->onopen(s->userdata);
+}
+static void sc_sack(Sctp* s) {
+  uint16_t gaps = 0;
+  sc_common(s, SCTP_SACK, 16);
+  sc_put32(s->buf + 16, s->rx_tsn);
+  sc_put32(s->buf + 20, 8192);
+  sc_put16(s->buf + 26, 0);
+  for (unsigned i = 0; i < 64; i++) {
+    if (!(s->rx_map & ((uint64_t)1 << i))) continue;
+    unsigned start = i + 1;
+    while (i + 1 < 64 && (s->rx_map & ((uint64_t)1 << (i + 1)))) i++;
+    sc_put16(s->buf + 28 + 4 * gaps, start);
+    sc_put16(s->buf + 30 + 4 * gaps++, i + 1);
+  }
+  sc_put16(s->buf + 24, gaps);
+  sc_put16(s->buf + 14, 16 + 4 * gaps);
+  sc_packet(s, 16 + 4 * gaps, s->verification_tag);
+}
+static void sc_rx_advance(Sctp* s) {
+  while (s->rx_map & 1) { s->rx_tsn++; s->rx_map >>= 1; }
+}
+static int sc_send(Sctp* s, const char* data, size_t len, SctpDataPpid ppid, uint16_t sid) {
+  unsigned flight = 0;
+  int slot = -1, known = 0;
+  size_t wire_len = len ? len : 1;
+  if (!s->connected) return -1;
+  for (int i = 0; i < s->stream_count; i++) known |= s->stream_table[i].sid == sid;
+  if (!known || len > SCTP_SINGLE_MESSAGE_MAX || (!data && len) ||
+      (ppid != PPID_STRING && ppid != PPID_BINARY)) return SCTP_SEND_INVALID;
+  for (int i = 0; i < SCTP_TX_SLOTS; i++) {
+    if (!s->tx[i].state) slot = i;
+    if (s->tx[i].state == 1) flight += s->tx[i].bytes;
+  }
+  if (slot < 0 || flight + wire_len + 16 > s->cwnd ||
+      (flight + wire_len > s->peer_rwnd && (s->peer_rwnd || flight))) return SCTP_SEND_BUSY;
+  sc_common(s, SCTP_DATA, 16 + wire_len);
+  s->buf[13] = 7; /* U|B|E：一个消息恰好一个 DATA，不做分片。 */
+  sc_put32(s->buf + 16, s->tsn);
+  sc_put16(s->buf + 20, sid); sc_put16(s->buf + 22, 0);
+  if (!len) ppid = ppid == PPID_STRING ? PPID_STRING_EMPTY : PPID_BINARY_EMPTY;
+  sc_put32(s->buf + 24, ppid);
+  if (len) memcpy(s->buf + 28, data, len); else s->buf[28] = 0;
+  /* 零重传模式下本地写失败也放弃该 TSN，由 FORWARD_TSN 清理。
+   * 返回 busy 表示未接纳数据，应用可稍后重新提交。 */
+  int ret = sc_packet(s, 16 + wire_len, s->verification_tag);
+  s->tx[slot].tsn = s->tsn++;
+  s->tx[slot].sent_at = ports_get_monotonic_time();
+  s->tx[slot].bytes = wire_len + 16;
+  s->tx[slot].state = ret > 0 ? 1 : 3;
+  return ret > 0 ? (int)len : SCTP_SEND_BUSY;
+}
+static void sc_accept_sack(Sctp* s, const uint8_t* c, size_t len) {
+  uint32_t ack = sc32(c + 4), credit = 0, flight = 0, sample = 0;
+  unsigned gaps = sc16(c + 12), dups = sc16(c + 14), last = 0;
+  if (16u + 4u * (gaps + dups) != len || sc_after(s->peer_ack, ack) ||
+      sc_after(ack, s->tsn - 1)) return;
+  for (unsigned i = 0; i < gaps; i++) {
+    unsigned start = sc16(c + 16 + 4 * i), end = sc16(c + 18 + 4 * i);
+    if (!start || start <= last || end < start || sc_after(ack + end, s->tsn - 1)) return;
+    last = end;
+  }
+  for (int i = 0; i < SCTP_TX_SLOTS; i++) if (s->tx[i].state == 1) flight += s->tx[i].bytes;
+  for (int i = 0; i < SCTP_TX_SLOTS; i++) {
+    if (!s->tx[i].state) continue;
+    int received = !sc_after(s->tx[i].tsn, ack);
+    for (unsigned j = 0; j < gaps && !received; j++) {
+      uint32_t delta = s->tx[i].tsn - ack;
+      received = delta >= sc16(c + 16 + 4 * j) && delta <= sc16(c + 18 + 4 * j);
+    }
+    if (received && s->tx[i].state == 1) {
+      credit += s->tx[i].bytes;
+      if (!sample) sample = (uint32_t)(ports_get_monotonic_time() - s->tx[i].sent_at) + 1;
+    }
+    if (!sc_after(s->tx[i].tsn, ack)) s->tx[i].state = 0;
+    else if (received) s->tx[i].state = 2;
+  }
+  s->peer_ack = ack; s->peer_rwnd = sc32(c + 8);
+  /* RFC 9260 6.3.1；此模式不重发 DATA，已放弃的记录不采 RTT。 */
+  if (sample && sample <= 60000) {
+    if (!s->srtt) { s->srtt = sample; s->rttvar = sample / 2; }
+    else {
+      uint32_t delta = s->srtt > sample ? s->srtt - sample : sample - s->srtt;
+      s->rttvar = (3 * s->rttvar + delta) / 4;
+      s->srtt = (7 * s->srtt + sample) / 8;
+    }
+    s->rto = s->srtt + (s->rttvar ? 4 * s->rttvar : 1);
+    if (s->rto < 1000) s->rto = 1000;
+    if (s->rto > 60000) s->rto = 60000;
+  }
+  /* 保守的慢启动/拥塞避免，且最多八条元数据；不因小消息无限膨胀。 */
+  if (credit && flight + SCTP_MTU > s->cwnd) {
+    if (s->cwnd <= s->ssthresh) s->cwnd += credit < SCTP_MTU ? credit : SCTP_MTU;
+    else { s->ca_bytes += credit; if (s->ca_bytes >= s->cwnd) { s->ca_bytes -= s->cwnd; s->cwnd += SCTP_MTU; } }
+    if (s->cwnd > SCTP_TX_SLOTS * SCTP_MTU) s->cwnd = SCTP_TX_SLOTS * SCTP_MTU;
+  }
+  if (s->forward_pending && !sc_after(s->forward_tsn, ack)) {
+    s->forward_pending = 0; s->retries = 0;
+  }
+}
+static int sc_start(Sctp* s) {
+  uint32_t seed[2];
+  if (mbedtls_ctr_drbg_random(&s->dtls_srtp->ctr_drbg, (unsigned char*)seed, sizeof(seed)) != 0) {
+    s->association_failed = 1; return -1;
+  }
+  s->local_tag = seed[0] ? seed[0] : 1; s->tsn = seed[1]; s->peer_ack = s->tsn - 1;
+  s->verification_tag = 0; s->rx_map = 0; s->phase = 1;
+  s->peer_streams = 0; s->peer_rwnd = 8192; s->rto = 1000; s->srtt = s->rttvar = 0;
+  s->cwnd = 4380; s->ssthresh = 8192; s->ca_bytes = 0;
+  s->connected = 0; s->association_failed = 0; s->forward_pending = 0;
+  memset(s->tx, 0, sizeof(s->tx));
+  sc_common(s, SCTP_INIT, 24);
+  sc_put32(s->buf + 16, s->local_tag); sc_put32(s->buf + 20, 8192);
+  sc_put16(s->buf + 24, 8); sc_put16(s->buf + 26, 8); sc_put32(s->buf + 28, s->tsn);
+  sc_put16(s->buf + 32, 0xc000); sc_put16(s->buf + 34, 4); /* PR-SCTP */
+  sc_packet(s, 24, 0); sc_save_handshake(s, 36);
+  return 0;
+}
+static void sc_incoming(Sctp* s, uint8_t* packet, size_t len) {
+  uint32_t crc = 0, actual;
+  if (!s->phase || len < 16 || sc16(packet) != s->remote_port || sc16(packet + 2) != s->local_port) return;
+  for (int i = 0; i < 4; i++) crc |= (uint32_t)packet[8 + i] << (8 * i);
+  memset(packet + 8, 0, 4); actual = crc32c(0xffffffff, packet, len);
+  for (int i = 0; i < 4; i++) packet[8 + i] = crc >> (8 * i);
+  if (crc != actual) return;
+  if (packet[12] == SCTP_INIT) {
+    if (sc32(packet + 4) || len != 12u + ((sc16(packet + 14) + 3u) & ~3u)) return;
+  } else if (sc32(packet + 4) != s->local_tag) return;
+  /* 先验证所有 chunk 边界，避免畸形报文产生部分状态更新。 */
+  for (size_t p = 12; p < len;) {
+    if (len - p < 4 || sc16(packet + p + 2) < 4) return;
+    size_t n = (sc16(packet + p + 2) + 3u) & ~3u;
+    if (n > len - p) return;
+    p += n;
+  }
+  for (size_t p = 12; p < len && s->phase;) {
+    const uint8_t* c = packet + p;
+    size_t n = sc16(c + 2);
+    switch (c[0]) {
+      case SCTP_INIT:
+      case SCTP_INIT_ACK: {
+        const uint8_t* cookie = NULL; size_t cookie_len = 0; int pr = 0;
+        if (s->phase != 1 || n < 20 || !sc32(c + 4) || !sc16(c + 12) || !sc16(c + 14)) return;
+        for (size_t q = 20; q < n;) {
+          if (n - q < 4) return;
+          unsigned l = sc16(c + q + 2);
+          if (l < 4 || l > n - q) return;
+          if (sc16(c + q) == 0xc000 && l == 4) pr = 1;
+          if (sc16(c + q) == 7) { cookie = c + q + 4; cookie_len = l - 4; }
+          q += (l + 3u) & ~3u;
+        }
+        if (!pr || (c[0] == SCTP_INIT_ACK && (!cookie || !cookie_len || cookie_len > sizeof(s->handshake) - 16))) {
+          s->association_failed = 1; sc_close(s); return;
+        }
+        s->verification_tag = sc32(c + 4); s->rx_tsn = sc32(c + 16) - 1;
+        s->peer_rwnd = sc32(c + 8); s->peer_streams = sc16(c + 14);
+        if (s->peer_streams > 8) s->peer_streams = 8;
+        if (c[0] == SCTP_INIT_ACK) {
+          sc_common(s, SCTP_COOKIE_ECHO, cookie_len + 4); memcpy(s->buf + 16, cookie, cookie_len);
+          sc_packet(s, cookie_len + 4, s->verification_tag);
+          sc_save_handshake(s, 12 + ((cookie_len + 7) & ~3u)); s->phase = 2;
+        } else {
+          sc_common(s, SCTP_INIT_ACK, 36);
+          sc_put32(s->buf + 16, s->local_tag); sc_put32(s->buf + 20, 8192);
+          sc_put16(s->buf + 24, s->peer_streams); sc_put16(s->buf + 26, 8); sc_put32(s->buf + 28, s->tsn);
+          sc_put16(s->buf + 32, 7); sc_put16(s->buf + 34, 12);
+          sc_put32(s->buf + 36, s->local_tag); sc_put32(s->buf + 40, s->verification_tag);
+          sc_put16(s->buf + 44, 0xc000); sc_put16(s->buf + 46, 4);
+          sc_packet(s, 36, s->verification_tag);
+        }
+      } break;
+      case SCTP_COOKIE_ECHO:
+        if (n != 12 || sc32(c + 4) != s->local_tag || sc32(c + 8) != s->verification_tag) return;
+        sc_common(s, SCTP_COOKIE_ACK, 4); sc_packet(s, 4, s->verification_tag); sc_open(s); break;
+      case SCTP_COOKIE_ACK:
+        if (n == 4 && s->phase == 2) sc_open(s);
+        break;
+      case SCTP_DATA: {
+        if (!s->connected || n < 17 || n > SCTP_SINGLE_MESSAGE_MAX + 16 || (c[1] & 7) != 7) return;
+        uint32_t tsn = sc32(c + 4), delta = tsn - s->rx_tsn, ppid = sc32(c + 12);
+        uint16_t sid = sc16(c + 8); int known = 0, fresh = 0;
+        if (sc_after(tsn, s->rx_tsn) && delta <= 64) {
+          uint64_t bit = (uint64_t)1 << (delta - 1);
+          fresh = !(s->rx_map & bit); s->rx_map |= bit; sc_rx_advance(s);
+        }
+        sc_sack(s); /* 回调可能发送消息并覆盖输出缓冲，必须先发确认。 */
+        for (int i = 0; i < s->stream_count; i++) known |= s->stream_table[i].sid == sid;
+        if (!fresh || !known) break;
+        if (ppid == PPID_STRING_EMPTY || ppid == PPID_BINARY_EMPTY) {
+          if (n != 17) break;
+        } else if (ppid != PPID_STRING && ppid != PPID_BINARY) break;
+        size_t bytes = (ppid == PPID_STRING_EMPTY || ppid == PPID_BINARY_EMPTY) ? 0 : n - 16;
+        SctpDataPpid type = (ppid == PPID_STRING || ppid == PPID_STRING_EMPTY) ? PPID_STRING : PPID_BINARY;
+        if (s->onmessage_ex) s->onmessage_ex((char*)c + 16, bytes, s->message_userdata, sid, type);
+        else if (s->onmessage) s->onmessage((char*)c + 16, bytes, s->userdata, sid);
+      } break;
+      case SCTP_SACK: if (s->connected && n >= 16) sc_accept_sack(s, c, n); break;
+      case SCTP_FORWARD_TSN:
+        if (!s->connected || n < 8 || ((n - 8) & 3)) return;
+        if (sc_after(sc32(c + 4), s->rx_tsn)) {
+          uint32_t delta = sc32(c + 4) - s->rx_tsn;
+          s->rx_map = delta >= 64 ? 0 : s->rx_map >> delta;
+          s->rx_tsn = sc32(c + 4); sc_rx_advance(s);
+        }
+        sc_sack(s); break;
+      case SCTP_HEARTBEAT:
+        if (n > sizeof(s->buf) - 12 || n < 8 || sc16(c + 4) != 1 || sc16(c + 6) != n - 4) return;
+        memcpy(s->buf + 12, c, n); s->buf[12] = SCTP_HEARTBEAT_ACK;
+        sc_packet(s, n, s->verification_tag); break;
+      case SCTP_SHUTDOWN:
+        if (n != 8) return;
+        sc_common(s, SCTP_SHUTDOWN_ACK, 4); sc_packet(s, 4, s->verification_tag);
+        sc_close(s); s->association_failed = 1; break;
+      case SCTP_ABORT:
+      case SCTP_SHUTDOWN_COMPLETE: sc_close(s); s->association_failed = 1; break;
+      default: if (!(c[0] & 0x80)) return; break;
+    }
+    p += (n + 3) & ~3u;
+  }
+}
+#endif
+
+int sctp_register_channel(Sctp* s, const char* label, uint16_t sid) {
+#if CONFIG_USE_USRSCTP
+  return -1;
+#else
+  if (!s || !s->negotiated || s->phase || !label || strlen(label) >= sizeof(s->stream_table[0].label) ||
+      sid >= 8 || s->stream_count >= 2) return -1;
+  for (int i = 0; i < s->stream_count; i++)
+    if (s->stream_table[i].sid == sid || !strcmp(s->stream_table[i].label, label)) return -1;
+  SctpStreamEntry* entry = &s->stream_table[s->stream_count++];
+  entry->sid = sid; strcpy(entry->label, label);
+  return 0;
+#endif
+}
+
+void sctp_tick(Sctp* s, uint32_t now) {
+#if !CONFIG_USE_USRSCTP
+  if (!s->negotiated || !s->phase) return;
+  if (s->phase < 3) {
+    if (s->handshake_len && (uint32_t)(now - s->timer_at) >= s->rto) {
+      if (++s->retries > 5) { s->association_failed = 1; sc_close(s); return; }
+      dtls_srtp_write(s->dtls_srtp, s->handshake, s->handshake_len);
+      s->timer_at = now; s->rto = s->rto < 30000 ? s->rto * 2 : 60000;
+    }
+    return;
+  }
+  int timeout = 0;
+  for (int i = 0; i < SCTP_TX_SLOTS; i++) {
+    if (s->tx[i].state == 1 && (uint32_t)(now - s->tx[i].sent_at) >= s->rto) {
+      s->tx[i].state = 3; timeout = 1;
+    }
+  }
+  if (timeout) {
+    s->ssthresh = s->cwnd / 2; if (s->ssthresh < 4 * SCTP_MTU) s->ssthresh = 4 * SCTP_MTU;
+    s->cwnd = SCTP_MTU; s->ca_bytes = 0;
+    s->rto = s->rto < 30000 ? s->rto * 2 : 60000;
+  }
+  uint32_t advance = s->peer_ack; int abandoned = 0;
+  for (int count = 0; count < SCTP_TX_SLOTS; count++) {
+    int found = 0;
+    for (int i = 0; i < SCTP_TX_SLOTS; i++) {
+      if (s->tx[i].state && s->tx[i].tsn == advance + 1 && s->tx[i].state != 1) {
+        abandoned |= s->tx[i].state == 3; advance++; found = 1; break;
+      }
+    }
+    if (!found) break;
+  }
+  if (abandoned && (!s->forward_pending || sc_after(advance, s->forward_tsn))) {
+    s->forward_tsn = advance; s->forward_pending = 1; s->timer_at = now - s->rto; s->retries = 0;
+  }
+  if (s->forward_pending && (uint32_t)(now - s->timer_at) >= s->rto) {
+    if (++s->retries > 5) { s->association_failed = 1; sc_close(s); return; }
+    sc_common(s, SCTP_FORWARD_TSN, 8); sc_put32(s->buf + 16, s->forward_tsn);
+    sc_packet(s, 8, s->verification_tag); s->timer_at = now;
+  }
+#endif
+}
+
 static int sctp_outgoing_data_cb(void* userdata, void* buf, size_t len, uint8_t tos, uint8_t set_df) {
   Sctp* sctp = (Sctp*)userdata;
 
@@ -110,6 +438,7 @@ int sctp_outgoing_data(Sctp* sctp, char* buf, size_t len, SctpDataPpid ppid, uin
   }
   return res;
 #else
+  if (sctp->negotiated) return sc_send(sctp, buf, len, ppid, sid);
   size_t padding_len = 0;
   size_t payload_max = SCTP_MTU - sizeof(SctpPacket) - sizeof(SctpDataChunk);
   size_t pos = 0;
@@ -220,6 +549,8 @@ void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
   sctp_handle_sctp_packet(sctp, buf, len);
   usrsctp_conninput(sctp, buf, len, 0);
 #else
+  if (sctp->negotiated) { sc_incoming(sctp, (uint8_t*)buf, len); return; }
+  if (len < sizeof(SctpHeader)) return;
   size_t length = 0;
   size_t pos = sizeof(SctpHeader);
   SctpChunkCommon* chunk_common;
@@ -694,6 +1025,7 @@ int sctp_create_association(Sctp* sctp, DtlsSrtp* dtls_srtp) {
 
   sctp->sock = sock;
 #else
+  if (sctp->negotiated) return sc_start(sctp);
   // send SCTP_INIT
   sctp->connected = 0;
   sctp->association_failed = 0;
@@ -726,6 +1058,9 @@ int sctp_create_association(Sctp* sctp, DtlsSrtp* dtls_srtp) {
 }
 
 void sctp_destroy_association(Sctp* sctp) {
+#if !CONFIG_USE_USRSCTP
+  if (sctp && sctp->negotiated) sc_close(sctp);
+#endif
 #if CONFIG_USE_USRSCTP
   if (sctp && sctp->sock) {
     usrsctp_shutdown(sctp->sock, SHUT_RDWR);

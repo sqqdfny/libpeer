@@ -40,6 +40,7 @@ typedef struct SdpGenerateParam {
   int is_answer;
   int h264_pt;
   int anchor_port;
+  unsigned max_message_size;
   SdpMediaInfo remote[SDP_MEDIA_COUNT];  /* offer 的 per-m-line mid/方向 */
   int mline_count;                       /* 生成器内部状态，调用方 memset 清零 */
 } SdpGenerateParam;

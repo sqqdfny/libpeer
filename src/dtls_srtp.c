@@ -160,6 +160,7 @@ int dtls_srtp_init(DtlsSrtp* dtls_srtp, DtlsSrtpRole role, void* user_data) {
 
   dtls_srtp->role = role;
   dtls_srtp->state = DTLS_SRTP_STATE_INIT;
+  dtls_srtp->handshake_callbacks_set = 0;
   dtls_srtp->user_data = user_data;
   dtls_srtp->udp_send = dtls_srtp_udp_send;
   dtls_srtp->udp_recv = dtls_srtp_udp_recv;
@@ -412,69 +413,41 @@ static void dtls_srtp_key_derivation_cb(void* context,
 }
 
 static int dtls_srtp_do_handshake(DtlsSrtp* dtls_srtp) {
-  int ret;
-
-  static mbedtls_timing_delay_context timer;
-
-  mbedtls_ssl_set_timer_cb(&dtls_srtp->ssl, &timer, mbedtls_timing_set_delay, mbedtls_timing_get_delay);
+  /* set_timer_cb 会取消活动计时器，非阻塞握手期间只能绑定一次。 */
+  if (!dtls_srtp->handshake_callbacks_set) {
+    mbedtls_ssl_set_timer_cb(&dtls_srtp->ssl, &dtls_srtp->timer, mbedtls_timing_set_delay, mbedtls_timing_get_delay);
 
 #if CONFIG_MBEDTLS_2_X
-  mbedtls_ssl_conf_export_keys_ext_cb(&dtls_srtp->conf, dtls_srtp_key_derivation_cb, dtls_srtp);
+    mbedtls_ssl_conf_export_keys_ext_cb(&dtls_srtp->conf, dtls_srtp_key_derivation_cb, dtls_srtp);
 #else
-  mbedtls_ssl_set_export_keys_cb(&dtls_srtp->ssl, dtls_srtp_key_derivation_cb, dtls_srtp);
+    mbedtls_ssl_set_export_keys_cb(&dtls_srtp->ssl, dtls_srtp_key_derivation_cb, dtls_srtp);
 #endif
 
-  mbedtls_ssl_set_bio(&dtls_srtp->ssl, dtls_srtp, dtls_srtp->udp_send, dtls_srtp->udp_recv, NULL);
+    mbedtls_ssl_set_bio(&dtls_srtp->ssl, dtls_srtp, dtls_srtp->udp_send, dtls_srtp->udp_recv, NULL);
+    dtls_srtp->handshake_callbacks_set = 1;
+  }
 
-  do {
-    ret = mbedtls_ssl_handshake(&dtls_srtp->ssl);
-
-  } while (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE);
-
-  return ret;
+  return mbedtls_ssl_handshake(&dtls_srtp->ssl);
 }
 
 static int dtls_srtp_handshake_server(DtlsSrtp* dtls_srtp) {
-  int ret;
-
-  while (1) {
+  if (dtls_srtp->state == DTLS_SRTP_STATE_INIT) {
     unsigned char client_ip[] = "test";
-
     mbedtls_ssl_session_reset(&dtls_srtp->ssl);
-
     mbedtls_ssl_set_client_transport_id(&dtls_srtp->ssl, client_ip, sizeof(client_ip));
-
-    ret = dtls_srtp_do_handshake(dtls_srtp);
-
-    if (ret == MBEDTLS_ERR_SSL_HELLO_VERIFY_REQUIRED) {
-      LOGD("DTLS hello verification requested");
-
-    } else if (ret != 0) {
-      LOGE("failed! mbedtls_ssl_handshake returned -0x%.4x", (unsigned int)-ret);
-
-      break;
-
-    } else {
-      break;
-    }
+    dtls_srtp->state = DTLS_SRTP_STATE_HANDSHAKE;
   }
-
-  LOGD("DTLS server handshake done");
-
+  int ret = dtls_srtp_do_handshake(dtls_srtp);
+  if (ret == MBEDTLS_ERR_SSL_HELLO_VERIFY_REQUIRED) {
+    dtls_srtp->state = DTLS_SRTP_STATE_INIT;
+    return MBEDTLS_ERR_SSL_WANT_READ;
+  }
   return ret;
 }
 
 static int dtls_srtp_handshake_client(DtlsSrtp* dtls_srtp) {
-  int ret;
-
-  ret = dtls_srtp_do_handshake(dtls_srtp);
-  if (ret != 0) {
-    LOGE("failed! mbedtls_ssl_handshake returned -0x%.4x\n\n", (unsigned int)-ret);
-  }
-
-  LOGD("DTLS client handshake done");
-
-  return ret;
+  if (dtls_srtp->state == DTLS_SRTP_STATE_INIT) dtls_srtp->state = DTLS_SRTP_STATE_HANDSHAKE;
+  return dtls_srtp_do_handshake(dtls_srtp);
 }
 
 int dtls_srtp_handshake(DtlsSrtp* dtls_srtp, Address* addr) {
@@ -486,6 +459,8 @@ int dtls_srtp_handshake(DtlsSrtp* dtls_srtp, Address* addr) {
   } else {
     ret = dtls_srtp_handshake_client(dtls_srtp);
   }
+
+  if (ret != 0) return ret;
 
   const mbedtls_x509_crt* remote_crt;
   if ((remote_crt = mbedtls_ssl_get_peer_cert(&dtls_srtp->ssl)) != NULL) {
@@ -532,6 +507,7 @@ void dtls_srtp_reset_session(DtlsSrtp* dtls_srtp) {
   }
 
   dtls_srtp->state = DTLS_SRTP_STATE_INIT;
+  dtls_srtp->handshake_callbacks_set = 0;
 }
 
 int dtls_srtp_write(DtlsSrtp* dtls_srtp, const unsigned char* buf, size_t len) {
@@ -545,16 +521,9 @@ int dtls_srtp_write(DtlsSrtp* dtls_srtp, const unsigned char* buf, size_t len) {
 }
 
 int dtls_srtp_read(DtlsSrtp* dtls_srtp, unsigned char* buf, size_t len) {
-  int ret;
-
   memset(buf, 0, len);
 
-  do {
-    ret = mbedtls_ssl_read(&dtls_srtp->ssl, buf, len);
-
-  } while (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE);
-
-  return ret;
+  return mbedtls_ssl_read(&dtls_srtp->ssl, buf, len);
 }
 
 int dtls_srtp_probe(uint8_t* buf) {
@@ -563,7 +532,7 @@ int dtls_srtp_probe(uint8_t* buf) {
 
   LOGD("DTLS content type: %d", buf[0]);
   // only handle application data
-  return (buf[0] == 0x17);
+  return (buf[0] >= 20 && buf[0] <= 63);
 }
 
 int dtls_srtp_decrypt_rtp_packet(DtlsSrtp* dtls_srtp, uint8_t* packet, int* bytes) {

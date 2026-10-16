@@ -75,6 +75,9 @@ typedef struct PeerConfiguration {
   MediaCodec audio_codec;
   MediaCodec video_codec;
   DataChannelType datachannel;
+  /* 双方固定 SID、negotiated:true、ordered:false、maxRetransmits:0。
+   * 此模式只支持 <=1152 字节的单 DATA 消息，不做应用数据重传/重组。 */
+  int datachannel_negotiated;
 
   void (*onaudiotrack)(uint8_t* data, size_t size, void* userdata);
   void (*onvideotrack)(uint8_t* data, size_t size, void* userdata);
@@ -115,6 +118,14 @@ int peer_connection_create_datachannel_sid(PeerConnection* pc, DecpChannelType c
 int peer_connection_datachannel_send(PeerConnection* pc, char* message, size_t len);
 
 int peer_connection_datachannel_send_sid(PeerConnection* pc, char* message, size_t len, uint16_t sid);
+/* 下列新增接口用于 datachannel_negotiated 模式。 */
+int peer_connection_register_datachannel(PeerConnection* pc, const char* label, uint16_t sid);
+/* 返回完整长度（空消息为 0），-1 未连接，-2 忙可重试，-3 参数/长度无效。 */
+int peer_connection_datachannel_send_ex(PeerConnection* pc, const void* message, size_t len,
+                                        uint16_t sid, DataChannelType type);
+/* 数据借用至回调返回；二进制中零字节和空消息均保留。 */
+void peer_connection_ondatachannelmessage(PeerConnection* pc,
+    void (*onmessage)(char*, size_t, void*, uint16_t, DataChannelType));
 
 int peer_connection_send_audio(PeerConnection* pc, const uint8_t* packet, size_t bytes);
 

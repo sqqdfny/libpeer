@@ -44,6 +44,8 @@ typedef enum DtlsSrtpState {
 typedef struct DtlsSrtp {
   // MbedTLS
   mbedtls_ssl_context ssl;
+  mbedtls_timing_delay_context timer;
+  int handshake_callbacks_set;
   mbedtls_ssl_config conf;
   mbedtls_ssl_cookie_ctx cookie_ctx;
   mbedtls_x509_crt cert;

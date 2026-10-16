@@ -145,6 +145,10 @@ typedef enum SctpDataPpid {
 } SctpDataPpid;
 
 #define SCTP_MAX_STREAMS 5
+#define SCTP_SINGLE_MESSAGE_MAX 1152
+#define SCTP_TX_SLOTS 8
+#define SCTP_SEND_BUSY (-2)
+#define SCTP_SEND_INVALID (-3)
 
 typedef struct {
   char label[32];  // Stream label
@@ -160,6 +164,23 @@ typedef struct Sctp {
   uint8_t association_failed;
   uint32_t verification_tag;
   uint32_t tsn;
+  /* 带外协商的单包、无序、零重传模式；旧接口未启用时保持原路径。 */
+  uint8_t negotiated;
+  void* message_userdata;
+  void (*onmessage_ex)(char* msg, size_t len, void* userdata, uint16_t sid, SctpDataPpid type);
+#if !CONFIG_USE_USRSCTP
+  uint32_t local_tag, rx_tsn, peer_ack, peer_rwnd;
+  uint64_t rx_map;
+  uint32_t cwnd, ssthresh, ca_bytes, rto, srtt, rttvar, timer_at, forward_tsn;
+  uint16_t peer_streams, handshake_len;
+  uint8_t phase, retries, forward_pending;
+  struct {
+    uint32_t tsn, sent_at;
+    uint16_t bytes;
+    uint8_t state; /* 0=空闲，1=在途，2=gap ACK，3=放弃 */
+  } tx[SCTP_TX_SLOTS];
+  uint8_t handshake[512];
+#endif
   DtlsSrtp* dtls_srtp;
   int stream_count;
   SctpStreamEntry stream_table[SCTP_MAX_STREAMS];
@@ -182,6 +203,9 @@ void sctp_usrsctp_init();
 void sctp_usrsctp_deinit();
 
 int sctp_is_connected(Sctp* sctp);
+/* 全部接口及回调由同一 PeerConnection 循环/锁串行调用。now_ms 为单调毫秒。 */
+void sctp_tick(Sctp* sctp, uint32_t now_ms);
+int sctp_register_channel(Sctp* sctp, const char* label, uint16_t sid);
 
 void sctp_incoming_data(Sctp* sctp, char* buf, size_t len);
 

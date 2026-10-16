@@ -177,7 +177,7 @@ void sdp_append_datachannel(char* sdp, SdpGenerateParam* gen) {
   sdp_append(sdp, "c=IN IP4 0.0.0.0");
   sdp_append(sdp, "a=mid:%s", mid);
   sdp_append(sdp, "a=sctp-port:5000");
-  sdp_append(sdp, "a=max-message-size:262144");
+  sdp_append(sdp, "a=max-message-size:%u", gen->max_message_size ? gen->max_message_size : 262144);
 }
 
 void sdp_create(char* sdp, int b_video, int b_audio, int b_datachannel, SdpGenerateParam* gen) {

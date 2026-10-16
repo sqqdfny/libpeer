@@ -50,6 +50,8 @@ struct PeerConnection {
   Agent agent;
   DtlsSrtp dtls_srtp;
   Sctp sctp;
+  uint32_t remote_message_max;
+  void (*onmessage_ex)(char*, size_t, void*, uint16_t, DataChannelType);
 
   char sdp[CONFIG_SDP_BUFFER_SIZE];
 
@@ -149,26 +151,20 @@ static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void
 }
 
 static int peer_connection_dtls_srtp_recv(void* ctx, unsigned char* buf, size_t len) {
-  int recv_max = 0;
-  int ret = -1;
   DtlsSrtp* dtls_srtp = (DtlsSrtp*)ctx;
   PeerConnection* pc = (PeerConnection*)dtls_srtp->user_data;
-
-  if (pc->agent_ret > 0 && pc->agent_ret <= len) {
-    memcpy(buf, pc->agent_buf, pc->agent_ret);
-    return pc->agent_ret;
+  if (pc->agent_ret > 0 && (size_t)pc->agent_ret <= len) {
+    int ret = pc->agent_ret;
+    memcpy(buf, pc->agent_buf, ret);
+    pc->agent_ret = -1; /* 每份 UDP 数据只能交给 Mbed TLS 一次。 */
+    return ret;
   }
-
-  while (recv_max < CONFIG_TLS_READ_TIMEOUT && pc->state == PEER_CONNECTION_CONNECTED) {
-    ret = agent_recv(&pc->agent, buf, len);
-
-    if (ret > 0) {
-      break;
-    }
-
-    recv_max++;
+  if (pc->state == PEER_CONNECTION_CONNECTED) {
+    int ret = agent_recv(&pc->agent, buf, len);
+    if (ret > 0) return ret;
   }
-  return ret;
+  /* UDP 暂时无数据或 STUN 被 agent 消费并非 EOF。 */
+  return MBEDTLS_ERR_SSL_WANT_READ;
 }
 
 static int peer_connection_dtls_srtp_send(void* ctx, const uint8_t* buf, size_t len) {
@@ -306,6 +302,9 @@ void* peer_connection_get_sctp(PeerConnection* pc) {
 }
 
 PeerConnection* peer_connection_create(PeerConfiguration* config) {
+#if CONFIG_USE_USRSCTP
+  if (config->datachannel_negotiated) return NULL;
+#endif
   uint32_t n = config->nack_ring_packets;
 
   /* n=0 合法(禁用重传); 非 0 必须为 2 的幂 —— n & (n-1) 对 n=0 也为 0 */
@@ -331,6 +330,8 @@ PeerConnection* peer_connection_create(PeerConfiguration* config) {
 
   memset(&pc->sctp, 0, sizeof(pc->sctp));
 
+  pc->sctp.negotiated = !!config->datachannel_negotiated;
+  pc->remote_message_max = 65536;
   pc->state = PEER_CONNECTION_NEW;
 
   pc->h264_pt = PT_H264;
@@ -412,6 +413,7 @@ int peer_connection_datachannel_send(PeerConnection* pc, char* message, size_t l
 }
 
 int peer_connection_datachannel_send_sid(PeerConnection* pc, char* message, size_t len, uint16_t sid) {
+  if (pc->sctp.negotiated && pc->remote_message_max && len > pc->remote_message_max) return SCTP_SEND_INVALID;
   if (!sctp_is_connected(&pc->sctp)) {
     LOGE("sctp not connected");
     return -1;
@@ -422,6 +424,31 @@ int peer_connection_datachannel_send_sid(PeerConnection* pc, char* message, size
     return sctp_outgoing_data(&pc->sctp, message, len, PPID_BINARY, sid);
 }
 
+int peer_connection_register_datachannel(PeerConnection* pc, const char* label, uint16_t sid) {
+  return pc ? sctp_register_channel(&pc->sctp, label, sid) : -1;
+}
+
+int peer_connection_datachannel_send_ex(PeerConnection* pc, const void* message, size_t len,
+                                        uint16_t sid, DataChannelType type) {
+  if (!pc || !pc->sctp.negotiated || (type != DATA_CHANNEL_STRING && type != DATA_CHANNEL_BINARY) ||
+      (!message && len) || (pc->remote_message_max && len > pc->remote_message_max)) return SCTP_SEND_INVALID;
+  return sctp_outgoing_data(&pc->sctp, (char*)message, len,
+                             type == DATA_CHANNEL_STRING ? PPID_STRING : PPID_BINARY, sid);
+}
+
+static void peer_connection_message_ex(char* msg, size_t len, void* userdata, uint16_t sid, SctpDataPpid type) {
+  PeerConnection* pc = (PeerConnection*)userdata;
+  if (pc->onmessage_ex) pc->onmessage_ex(msg, len, pc->config.user_data, sid,
+      type == PPID_STRING ? DATA_CHANNEL_STRING : DATA_CHANNEL_BINARY);
+}
+
+void peer_connection_ondatachannelmessage(PeerConnection* pc,
+    void (*onmessage)(char*, size_t, void*, uint16_t, DataChannelType)) {
+  pc->onmessage_ex = onmessage;
+  pc->sctp.onmessage_ex = onmessage ? peer_connection_message_ex : NULL;
+  pc->sctp.message_userdata = pc;
+}
+
 int peer_connection_create_datachannel(PeerConnection* pc, DecpChannelType channel_type, uint16_t priority, uint32_t reliability_parameter, char* label, char* protocol) {
   return peer_connection_create_datachannel_sid(pc, channel_type, priority, reliability_parameter, label, protocol, 0);
 }
@@ -429,6 +456,7 @@ int peer_connection_create_datachannel(PeerConnection* pc, DecpChannelType chann
 int peer_connection_create_datachannel_sid(PeerConnection* pc, DecpChannelType channel_type, uint16_t priority, uint32_t reliability_parameter, char* label, char* protocol, uint16_t sid) {
   int rtrn = -1;
 
+  if (pc->sctp.negotiated) return SCTP_SEND_INVALID;
   if (!sctp_is_connected(&pc->sctp)) {
     LOGE("sctp not connected");
     return rtrn;
@@ -479,6 +507,7 @@ static char* peer_connection_dtls_role_setup_value(DtlsSrtpRole d) {
 }
 
 int peer_connection_loop(PeerConnection* pc) {
+  int handshake_ret;
   uint32_t ssrc = 0;
   memset(pc->agent_buf, 0, sizeof(pc->agent_buf));
   pc->agent_ret = -1;
@@ -520,7 +549,8 @@ int peer_connection_loop(PeerConnection* pc) {
 
     case PEER_CONNECTION_CONNECTED:
 
-      if (dtls_srtp_handshake(&pc->dtls_srtp, NULL) == 0) {
+      handshake_ret = dtls_srtp_handshake(&pc->dtls_srtp, NULL);
+      if (handshake_ret == 0) {
         LOGD("DTLS-SRTP handshake done");
 
         if (pc->dtls_srtp.state != DTLS_SRTP_STATE_CONNECTED) {
@@ -531,8 +561,11 @@ int peer_connection_loop(PeerConnection* pc) {
 
         if (pc->config.datachannel) {
           LOGI("SCTP create socket");
-          sctp_create_association(&pc->sctp, &pc->dtls_srtp);
           pc->sctp.userdata = pc->config.user_data;
+          if (sctp_create_association(&pc->sctp, &pc->dtls_srtp) < 0) {
+            STATE_CHANGED(pc, PEER_CONNECTION_FAILED);
+            break;
+          }
         }
 
         /**
@@ -542,6 +575,11 @@ int peer_connection_loop(PeerConnection* pc) {
         pc->agent.binding_request_time = ports_get_epoch_time();
         STATE_CHANGED(pc, PEER_CONNECTION_COMPLETED);
       } else {
+        if (handshake_ret != MBEDTLS_ERR_SSL_WANT_READ && handshake_ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+          LOGE("DTLS handshake failed: %d", handshake_ret);
+          STATE_CHANGED(pc, PEER_CONNECTION_FAILED);
+          break;
+        }
         if ((ports_get_epoch_time() - pc->handshake_start_time) > CONFIG_DTLS_HANDSHAKE_TIMEOUT) {
             LOGW("handshake timeout");
             STATE_CHANGED(pc, PEER_CONNECTION_FAILED);
@@ -595,6 +633,7 @@ int peer_connection_loop(PeerConnection* pc) {
         }
       }
 
+      sctp_tick(&pc->sctp, ports_get_monotonic_time());
       if (pc->config.datachannel && pc->sctp.association_failed) {
         LOGI("SCTP association failed");
         STATE_CHANGED(pc, PEER_CONNECTION_CLOSED);
@@ -621,6 +660,8 @@ int peer_connection_loop(PeerConnection* pc) {
 }
 
 void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp, SdpType type) {
+  const char* limit = strstr(sdp, "a=max-message-size:");
+  pc->remote_message_max = limit ? strtoul(limit + 19, NULL, 10) : 65536;
   char* start = (char*)sdp;
   char* line = NULL;
   char buf[256];
@@ -743,6 +784,7 @@ static const char* peer_connection_create_sdp(PeerConnection* pc, SdpType sdp_ty
   gen.is_answer = (sdp_type == SDP_TYPE_ANSWER);
   gen.h264_pt = pc->h264_pt;
   gen.anchor_port = SDP_DATACHANNEL_PORT;
+  gen.max_message_size = pc->sctp.negotiated ? SCTP_SINGLE_MESSAGE_MAX : 262144;
   memcpy(gen.remote, pc->remote_media, sizeof(gen.remote));
 
   // TODO: check if we have video or audio codecs
