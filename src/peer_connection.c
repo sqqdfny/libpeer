@@ -13,11 +13,18 @@
 #include "sctp.h"
 #include "sdp.h"
 
+static void peer_connection_reset_bandwidth(PeerConnection* pc);
+
 #define STATE_CHANGED(pc, curr_state)                                 \
+  do {                                                                \
+    if (curr_state != PEER_CONNECTION_COMPLETED) {                     \
+      peer_connection_reset_bandwidth(pc);                             \
+    }                                                                 \
   if (pc->oniceconnectionstatechange && pc->state != curr_state) {    \
     pc->oniceconnectionstatechange(curr_state, pc->config.user_data); \
     pc->state = curr_state;                                           \
-  }
+    }                                                                 \
+  } while (0)
 
 // Max datagrams drained per peer_connection_loop() call. A single video frame
 // generates dozens of SACKs; draining one per call throttles the peer to the
@@ -86,6 +93,19 @@ struct PeerConnection {
    * 对上层不可见，必须在此收敛点显式计数。 */
   uint32_t rtp_packets_sent;
   uint32_t rtp_send_failures;
+  uint64_t video_bytes_sent;
+  uint64_t audio_bytes_sent;
+
+  SdpRembCapabilities remote_remb;
+  int remb_negotiated;
+  int remb_offered;
+  uint64_t remb_bps;
+  uint32_t remb_feedback_time;
+  uint32_t remb_feedback_count;
+  int remb_includes_audio;
+  uint64_t ast_clock_ms;
+  uint32_t ast_last_ms;
+  int ast_clock_initialized;
 
   /* 拥塞帧放弃：FU-A 帧丢一片整帧即废。视频轨本帧首次发送失败后，
    * 同 timestamp 的剩余分片直接丢弃（等待对端 PLI → IDR 重发恢复）。 */
@@ -98,15 +118,38 @@ struct PeerConnection {
   nack_ring_entry_t nack_ring[0];
 };
 
+static void peer_connection_reset_bandwidth(PeerConnection* pc) {
+  pc->remb_bps = 0;
+  pc->remb_feedback_time = 0;
+  pc->remb_feedback_count = 0;
+  pc->remb_includes_audio = 0;
+}
+
+static uint64_t peer_connection_abs_send_time_ms(PeerConnection* pc, uint32_t now_ms) {
+  if (!pc->ast_clock_initialized) {
+    pc->ast_clock_ms = now_ms;
+    pc->ast_clock_initialized = 1;
+  } else {
+    /* 扩展 32 位单调时钟，避免约 49.7 天回绕时 AST 额外跳变。 */
+    pc->ast_clock_ms += (uint32_t)(now_ms - pc->ast_last_ms);
+  }
+  pc->ast_last_ms = now_ms;
+  return pc->ast_clock_ms;
+}
+
 static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void* user_data) {
   PeerConnection* pc = (PeerConnection*)user_data;
+  int is_video = pc->config.video_codec != CODEC_NONE && size >= sizeof(RtpHeader) &&
+                 rtp_get_ssrc(data) == pc->vrtp_encoder.ssrc;
+  if (is_video && pc->vrtp_encoder.abs_send_time_id &&
+      rtp_write_abs_send_time(data, size, pc->vrtp_encoder.abs_send_time_id,
+          peer_connection_abs_send_time_ms(pc, ports_get_monotonic_time())) != 0)
+    return;
   if (dtls_srtp_encrypt_rtp_packet(&pc->dtls_srtp, data, (int*)&size) != 0) {
     /* 加密失败不发送：对端必然鉴权丢弃，缓存与发送都无意义 */
     LOGW("srtp_protect failed, drop outbound RTP");
     return;
   }
-
-  int is_video = (pc->config.video_codec != CODEC_NONE) && ((data[1] & 0x7F) == (uint8_t)pc->vrtp_encoder.type);
 
   /* 缓存密文(含 auth tag)供 NACK 原样重发；只缓存视频轨。
    * 必须在下方的帧放弃判断之前：本帧后续分片被丢弃时，已成功发送的
@@ -148,6 +191,10 @@ static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void
     }
   }
   pc->rtp_packets_sent++;
+  if (is_video)
+    pc->video_bytes_sent += size;
+  else if (pc->config.audio_codec != CODEC_NONE)
+    pc->audio_bytes_sent += size;
 }
 
 static int peer_connection_dtls_srtp_recv(void* ctx, unsigned char* buf, size_t len) {
@@ -188,59 +235,65 @@ static void peer_connection_nack_retransmit(PeerConnection* pc, uint16_t seq) {
       pc->rtp_send_failures++;
     } else {
       pc->rtp_packets_sent++;
+      pc->video_bytes_sent += e->len;
     }
     pc->nack_retransmits++;
   }
 }
 
 static void peer_connection_incoming_rtcp(PeerConnection* pc, uint8_t* buf, size_t len) {
-  RtcpHeader* rtcp_header;
   size_t pos = 0;
+  RtcpRemb remb;
+  int remb_result = rtcp_parse_remb(buf, len, pc->vrtp_encoder.ssrc,
+                                   pc->config.audio_codec ? pc->artp_encoder.ssrc : 0, &remb);
+  /* 先校验整个复合包，禁止截断的后续块使前面的反馈部分生效。 */
+  if (remb_result < 0)
+    return;
+  if (remb_result == 1 && pc->remb_negotiated) {
+    pc->remb_bps = remb.bitrate_bps;
+    pc->remb_feedback_time = ports_get_monotonic_time();
+    pc->remb_includes_audio = remb.includes_audio;
+    if (pc->remb_feedback_count != UINT32_MAX)
+      pc->remb_feedback_count++;
+  }
 
   while (pos < len) {
-    rtcp_header = (RtcpHeader*)(buf + pos);
+    const uint8_t* block = buf + pos;
+    size_t block_size = ((((size_t)block[2] << 8) | block[3]) + 1) * 4;
+    size_t content_size = block_size;
+    if (block[0] & 0x20)
+      content_size -= block[block_size - 1];
+    int fmt = block[0] & 0x1f;
 
-    switch (rtcp_header->type) {
+    switch (block[1]) {
       case RTCP_RR:
-        LOGD("RTCP_PR");
-        if (rtcp_header->rc > 0) {
-// TODO: REMB, GCC ...etc
-#if 0
-          RtcpRr rtcp_rr = rtcp_parse_rr(buf);
-          uint32_t fraction = ntohl(rtcp_rr.report_block[0].flcnpl) >> 24;
-          uint32_t total = ntohl(rtcp_rr.report_block[0].flcnpl) & 0x00FFFFFF;
-          if(pc->on_receiver_packet_loss && fraction > 0) {
-
-            pc->on_receiver_packet_loss((float)fraction/256.0, total, pc->config.user_data);
-          }
-#endif
-        }
+        /* 丢包控制仍未启用，本阶段仅消费 REMB。 */
         break;
       case RTCP_PSFB: {
-        int fmt = rtcp_header->rc;
         LOGD("RTCP_PSFB %d", fmt);
         // PLI and FIR
-        if ((fmt == 1 || fmt == 4) && pc->config.on_request_keyframe) {
+        if (((fmt == 1 && content_size == 12) || (fmt == 4 && content_size >= 20)) &&
+            pc->config.on_request_keyframe) {
           pc->config.on_request_keyframe(pc->config.user_data);
         }
         break;
       }
       case RTCP_RTPFB: {
-        int fmt = rtcp_header->rc;
         LOGD("RTCP_RTPFB %d", fmt);
         /* RFC 4585 generic NACK (fmt=1): FCI = PID(2B) + BLP(2B),
          * 位于 pos+12 (RtcpHeader 4B + sender SSRC 4B + media SSRC 4B) */
-        if (fmt == 1 && pos + 16 <= len) {
-          const uint8_t* fci = buf + pos + 12;
-          uint32_t media = ((uint32_t)buf[pos + 8] << 24) | ((uint32_t)buf[pos + 9] << 16) |
-                           ((uint32_t)buf[pos + 10] << 8) | buf[pos + 11];
+        if (fmt == 1 && content_size >= 16 && (content_size - 12) % 4 == 0) {
+          uint32_t media = ((uint32_t)block[8] << 24) | ((uint32_t)block[9] << 16) |
+                           ((uint32_t)block[10] << 8) | block[11];
           /* 只响应视频轨的 NACK: media SSRC == 本地视频 SSRC */
           if (media == pc->vrtp_encoder.ssrc) {
+            for (size_t offset = 12; offset + 4 <= content_size; offset += 4) {
+              const uint8_t* fci = block + offset;
             uint16_t base = ((uint16_t)fci[0] << 8) | fci[1];
             uint16_t blp = ((uint16_t)fci[2] << 8) | fci[3];
             peer_connection_nack_retransmit(pc, base);
             for (int i = 0; i < 16; i++) {
-              if (blp & (1u << i)) {
+                if (blp & (1u << i))
                 peer_connection_nack_retransmit(pc, (uint16_t)(base + i + 1));
               }
             }
@@ -252,7 +305,7 @@ static void peer_connection_incoming_rtcp(PeerConnection* pc, uint8_t* buf, size
         break;
     }
 
-    pos += 4 * ntohs(rtcp_header->length) + 4;
+    pos += block_size;
   }
 }
 
@@ -295,6 +348,27 @@ uint32_t peer_connection_get_rtp_packets_sent(PeerConnection* pc) {
 
 uint32_t peer_connection_get_rtp_send_failures(PeerConnection* pc) {
   return pc->rtp_send_failures;
+}
+
+int peer_connection_get_bandwidth_estimate(PeerConnection* pc, PeerBandwidthEstimate* estimate) {
+  if (!pc || !estimate)
+    return -1;
+  memset(estimate, 0, sizeof(*estimate));
+  estimate->feedback_age_ms = UINT32_MAX;
+  estimate->video_bytes_sent = pc->video_bytes_sent;
+  estimate->audio_bytes_sent = pc->audio_bytes_sent;
+  if (!pc->remb_negotiated) {
+    estimate->state = PEER_BANDWIDTH_UNSUPPORTED;
+  } else if (pc->state != PEER_CONNECTION_COMPLETED || pc->remb_feedback_count == 0) {
+    estimate->state = PEER_BANDWIDTH_WAITING;
+  } else {
+    estimate->remb_bps = pc->remb_bps;
+    estimate->feedback_age_ms = ports_get_monotonic_time() - pc->remb_feedback_time;
+    estimate->feedback_count = pc->remb_feedback_count;
+    estimate->includes_audio = pc->remb_includes_audio;
+    estimate->state = estimate->feedback_age_ms > 1000 ? PEER_BANDWIDTH_STALE : PEER_BANDWIDTH_VALID;
+  }
+  return 0;
 }
 
 void* peer_connection_get_sctp(PeerConnection* pc) {
@@ -366,6 +440,9 @@ void peer_connection_destroy(PeerConnection* pc) {
 }
 
 void peer_connection_close(PeerConnection* pc) {
+  pc->remb_negotiated = 0;
+  pc->remb_offered = 0;
+  pc->vrtp_encoder.abs_send_time_id = 0;
   STATE_CHANGED(pc, PEER_CONNECTION_CLOSED);
 }
 
@@ -673,9 +750,13 @@ void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp,
   Agent* agent = &pc->agent;
 
   while ((line = strstr(start, "\r\n"))) {
-    line = strstr(start, "\r\n");
-    strncpy(buf, start, line - start);
-    buf[line - start] = '\0';
+    size_t line_size = (size_t)(line - start);
+    if (line_size >= sizeof(buf)) {
+      start = line + 2;
+      continue;
+    }
+    memcpy(buf, start, line_size);
+    buf[line_size] = '\0';
 
     if (strstr(buf, "a=setup:passive")) {
       role = DTLS_SRTP_ROLE_CLIENT;
@@ -737,6 +818,20 @@ void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp,
     start = line + 2;
   }
 
+  peer_connection_reset_bandwidth(pc);
+  memset(&pc->remote_remb, 0, sizeof(pc->remote_remb));
+  pc->remb_negotiated = 0;
+  pc->vrtp_encoder.abs_send_time_id = 0;
+  if (pc->config.enable_remb && pc->config.video_codec == CODEC_H264) {
+    sdp_get_remb_capabilities(sdp, pc->h264_pt, &pc->remote_remb);
+    if (type == SDP_TYPE_ANSWER && pc->remb_offered) {
+      pc->remb_negotiated = pc->remote_remb.goog_remb;
+      /* answer 不得更换 offer 的扩展 ID；拒绝 AST 不影响 REMB 本身。 */
+      if (pc->remb_negotiated && pc->remote_remb.abs_send_time_id == SDP_ABS_SEND_TIME_ID)
+        pc->vrtp_encoder.abs_send_time_id = SDP_ABS_SEND_TIME_ID;
+    }
+  }
+
   if (is_update) {
     return;
   }
@@ -786,6 +881,22 @@ static const char* peer_connection_create_sdp(PeerConnection* pc, SdpType sdp_ty
   gen.anchor_port = SDP_DATACHANNEL_PORT;
   gen.max_message_size = pc->sctp.negotiated ? SCTP_SINGLE_MESSAGE_MAX : 262144;
   memcpy(gen.remote, pc->remote_media, sizeof(gen.remote));
+  peer_connection_reset_bandwidth(pc);
+  pc->remb_negotiated = 0;
+  pc->vrtp_encoder.abs_send_time_id = 0;
+  if (pc->config.enable_remb && pc->config.video_codec == CODEC_H264) {
+    if (sdp_type == SDP_TYPE_OFFER) {
+      memset(&pc->remote_remb, 0, sizeof(pc->remote_remb));
+      gen.enable_remb = 1;
+      gen.abs_send_time_id = SDP_ABS_SEND_TIME_ID;
+    } else {
+      gen.enable_remb = pc->remote_remb.goog_remb;
+      gen.abs_send_time_id = gen.enable_remb ? pc->remote_remb.abs_send_time_id : 0;
+      pc->remb_negotiated = gen.enable_remb;
+      pc->vrtp_encoder.abs_send_time_id = gen.abs_send_time_id;
+    }
+  }
+  pc->remb_offered = sdp_type == SDP_TYPE_OFFER && gen.enable_remb;
 
   // TODO: check if we have video or audio codecs
   sdp_create(pc->sdp,

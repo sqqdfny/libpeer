@@ -1,6 +1,7 @@
 #ifndef SDP_H_
 #define SDP_H_
 
+#include <stdint.h>
 #include <string.h>
 #include "config.h"
 
@@ -8,6 +9,8 @@
 
 #define SDP_MID_MAX_LEN 32
 #define SDP_DATACHANNEL_PORT 50712
+#define SDP_ABS_SEND_TIME_URI "http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time"
+#define SDP_ABS_SEND_TIME_ID 3
 
 #ifndef ICE_LITE
 #define ICE_LITE 0
@@ -33,6 +36,11 @@ typedef struct SdpMediaInfo {
   SdpDirection direction;
 } SdpMediaInfo;
 
+typedef struct SdpRembCapabilities {
+  int goog_remb;
+  uint8_t abs_send_time_id;
+} SdpRembCapabilities;
+
 /* SDP 生成上下文：OFFER 按现状输出（端口 9/9/50712、语义名 mid、恒 sendrecv）；
  * ANSWER 按 RFC 5888/8843/3264 归一：anchor 端口 50712 + 其余 0/a=bundle-only、
  * mid 回显 offer、方向按 offer 取反 */
@@ -41,6 +49,8 @@ typedef struct SdpGenerateParam {
   int h264_pt;
   int anchor_port;
   unsigned max_message_size;
+  int enable_remb;
+  uint8_t abs_send_time_id;
   SdpMediaInfo remote[SDP_MEDIA_COUNT];  /* offer 的 per-m-line mid/方向 */
   int mline_count;                       /* 生成器内部状态，调用方 memset 清零 */
 } SdpGenerateParam;
@@ -60,5 +70,8 @@ void sdp_create(char* sdp, int b_video, int b_audio, int b_datachannel, SdpGener
 int sdp_append(char* sdp, const char* format, ...);
 
 void sdp_reset(char* sdp);
+
+/* 仅返回对端可接收的选定 H264 PT 的能力；0 成功，-1 参数无效。 */
+int sdp_get_remb_capabilities(const char* sdp, int h264_pt, SdpRembCapabilities* caps);
 
 #endif  // SDP_H_

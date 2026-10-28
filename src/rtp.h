@@ -90,6 +90,7 @@ struct RtpEncoder {
   uint32_t ssrc;
   uint32_t timestamp;
   uint32_t timestamp_increment;
+  uint32_t abs_send_time_id; /* 0 关闭；1..14 为扩展 ID；保持后续 RTP 缓冲区对齐 */
   uint8_t buf[CONFIG_MTU + 128];
 };
 
@@ -109,5 +110,8 @@ void rtp_decoder_init(RtpDecoder* rtp_decoder, MediaCodec codec, RtpOnPacket on_
 int rtp_decoder_decode(RtpDecoder* rtp_decoder, const uint8_t* data, size_t size);
 
 uint32_t rtp_get_ssrc(uint8_t* packet);
+
+/* 在加密前更新已预留的 AST 扩展，now_ms 为单调毫秒时钟。 */
+int rtp_write_abs_send_time(uint8_t* packet, size_t size, uint8_t id, uint64_t now_ms);
 
 #endif  // RTP_H_

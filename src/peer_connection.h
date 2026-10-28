@@ -29,6 +29,24 @@ typedef enum PeerConnectionState {
 
 } PeerConnectionState;
 
+typedef enum PeerBandwidthState {
+  PEER_BANDWIDTH_UNSUPPORTED = 0,
+  PEER_BANDWIDTH_WAITING,
+  PEER_BANDWIDTH_VALID,
+  PEER_BANDWIDTH_STALE,
+} PeerBandwidthState;
+
+typedef struct PeerBandwidthEstimate {
+  PeerBandwidthState state;
+  uint64_t remb_bps;
+  uint32_t feedback_age_ms; /* 无反馈时为 UINT32_MAX */
+  uint32_t feedback_count;
+  int includes_audio;
+  /* 成功投递的 SRTP 字节（包含 RTP 头、扩展与鉴权 tag，视频包含 NACK）。 */
+  uint64_t video_bytes_sent;
+  uint64_t audio_bytes_sent;
+} PeerBandwidthEstimate;
+
 typedef enum DataChannelType {
 
   DATA_CHANNEL_NONE = 0,
@@ -86,6 +104,8 @@ typedef struct PeerConfiguration {
 
   /* NACK 重传 ring 槽位数: 0 = 禁用; 非 0 必须为 2 的幂 (非法时 create 失败) */
   uint32_t nack_ring_packets;
+
+  int enable_remb; /* 默认 0；通过 RTCP 获取带宽反馈，不使用 DataChannel */
 
 } PeerConfiguration;
 
@@ -153,6 +173,9 @@ uint32_t peer_connection_get_srtp_auth_failures(PeerConnection* pc);
 uint32_t peer_connection_get_rtp_packets_sent(PeerConnection* pc);
 
 uint32_t peer_connection_get_rtp_send_failures(PeerConnection* pc);
+
+/* 与 loop/send/close 使用同一把外部锁；复制快照，不持有内部地址。 */
+int peer_connection_get_bandwidth_estimate(PeerConnection* pc, PeerBandwidthEstimate* estimate);
 
 void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp, SdpType sdp_type);
 

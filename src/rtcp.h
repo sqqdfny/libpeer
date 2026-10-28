@@ -1,6 +1,9 @@
 #ifndef RTCP_H_
 #define RTCP_H_
 
+#include <stddef.h>
+#include <stdint.h>
+
 #ifdef __BYTE_ORDER
 #define __BIG_ENDIAN 4321
 #define __LITTLE_ENDIAN 1234
@@ -78,5 +81,15 @@ int rtcp_get_pli(uint8_t* packet, int len, uint32_t ssrc);
 int rtcp_get_fir(uint8_t* packet, int len, int* seqnr);
 
 RtcpRr rtcp_parse_rr(uint8_t* packet);
+
+typedef struct RtcpRemb {
+  uint64_t bitrate_bps;
+  int includes_audio;
+} RtcpRemb;
+
+/* 返回 1 表示匹配本地视频，0 表示无匹配，-1 表示报文非法。
+ * 整个复合包校验通过后才写入结果；允许合法的零带宽估计。 */
+int rtcp_parse_remb(const uint8_t* packet, size_t size, uint32_t video_ssrc,
+                    uint32_t audio_ssrc, RtcpRemb* remb);
 
 #endif  // RTCP_H_

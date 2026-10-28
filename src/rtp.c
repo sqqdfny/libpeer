@@ -27,8 +27,40 @@ typedef struct FuHeader {
   uint8_t s : 1;
 } FuHeader;
 
-#define RTP_PAYLOAD_SIZE (CONFIG_MTU - sizeof(RtpHeader))
 #define FU_PAYLOAD_SIZE (CONFIG_MTU - sizeof(RtpHeader) - sizeof(FuHeader) - sizeof(NaluHeader))
+#define RTP_ABS_SEND_TIME_SIZE 8
+
+static size_t rtp_h264_header_size(const RtpEncoder* encoder) {
+  return sizeof(RtpHeader) + (encoder->abs_send_time_id ? RTP_ABS_SEND_TIME_SIZE : 0);
+}
+
+static uint8_t* rtp_h264_payload(RtpEncoder* encoder) {
+  uint8_t* payload = encoder->buf + sizeof(RtpHeader);
+  if (encoder->abs_send_time_id) {
+    /* RFC 8285 单字节扩展：一个 3 字节 AST 元素，无额外填充。 */
+    payload[0] = 0xbe;
+    payload[1] = 0xde;
+    payload[2] = 0;
+    payload[3] = 1;
+    payload[4] = (encoder->abs_send_time_id << 4) | 2;
+    memset(payload + 5, 0, 3);
+    payload += RTP_ABS_SEND_TIME_SIZE;
+  }
+  return payload;
+}
+
+int rtp_write_abs_send_time(uint8_t* packet, size_t size, uint8_t id, uint64_t now_ms) {
+  if (!packet || size < sizeof(RtpHeader) + RTP_ABS_SEND_TIME_SIZE || id == 0 || id > 14 ||
+      packet[0] != 0x90 || packet[12] != 0xbe || packet[13] != 0xde ||
+      packet[14] != 0 || packet[15] != 1 || packet[16] != ((id << 4) | 2))
+    return -1;
+  /* 6.18 固定点，先按 64 秒取模，避免长运行时间左移溢出。 */
+  uint32_t timestamp = (uint32_t)(((now_ms % 64000) << 18) / 1000);
+  packet[17] = timestamp >> 16;
+  packet[18] = timestamp >> 8;
+  packet[19] = timestamp;
+  return 0;
+}
 
 int rtp_packet_validate(uint8_t* packet, size_t size) {
   if (size < 12)
@@ -48,7 +80,7 @@ static int rtp_encoder_encode_h264_single(RtpEncoder* rtp_encoder, uint8_t* buf,
 
   rtp_packet->header.version = 2;
   rtp_packet->header.padding = 0;
-  rtp_packet->header.extension = 0;
+  rtp_packet->header.extension = (rtp_encoder->abs_send_time_id != 0);
   rtp_packet->header.csrccount = 0;
   // marker 表示 access unit 结束：仅帧末 NAL 置位（RFC 6184 5.1）
   rtp_packet->header.markerbit = is_last;
@@ -62,8 +94,8 @@ static int rtp_encoder_encode_h264_single(RtpEncoder* rtp_encoder, uint8_t* buf,
        rtp_encoder->timestamp, rtp_encoder->seq_number, rtp_packet->header.markerbit);
 #endif
 
-  memcpy(rtp_packet->payload, buf, size);
-  rtp_encoder->on_packet(rtp_encoder->buf, size + sizeof(RtpHeader), rtp_encoder->user_data);
+  memcpy(rtp_h264_payload(rtp_encoder), buf, size);
+  rtp_encoder->on_packet(rtp_encoder->buf, size + rtp_h264_header_size(rtp_encoder), rtp_encoder->user_data);
   return 0;
 }
 
@@ -72,7 +104,7 @@ static int rtp_encoder_encode_h264_fu_a(RtpEncoder* rtp_encoder, uint8_t* buf, s
 
   rtp_packet->header.version = 2;
   rtp_packet->header.padding = 0;
-  rtp_packet->header.extension = 0;
+  rtp_packet->header.extension = (rtp_encoder->abs_send_time_id != 0);
   rtp_packet->header.csrccount = 0;
   rtp_packet->header.markerbit = 0;
   rtp_packet->header.type = rtp_encoder->type;
@@ -84,8 +116,10 @@ static int rtp_encoder_encode_h264_fu_a(RtpEncoder* rtp_encoder, uint8_t* buf, s
   buf = buf + 1;
   size = size - 1;
 
-  NaluHeader* fu_indicator = (NaluHeader*)rtp_packet->payload;
-  FuHeader* fu_header = (FuHeader*)rtp_packet->payload + sizeof(NaluHeader);
+  uint8_t* payload = rtp_h264_payload(rtp_encoder);
+  size_t fu_payload_size = FU_PAYLOAD_SIZE - (rtp_encoder->abs_send_time_id ? RTP_ABS_SEND_TIME_SIZE : 0);
+  NaluHeader* fu_indicator = (NaluHeader*)payload;
+  FuHeader* fu_header = (FuHeader*)(payload + sizeof(NaluHeader));
   fu_header->s = 1;
 
   while (size > 0) {
@@ -96,7 +130,7 @@ static int rtp_encoder_encode_h264_fu_a(RtpEncoder* rtp_encoder, uint8_t* buf, s
     fu_header->r = 0;
     rtp_packet->header.seq_number = htons(rtp_encoder->seq_number++);
 
-    if (size <= FU_PAYLOAD_SIZE) {
+    if (size <= fu_payload_size) {
       fu_header->e = 1;
       // 末片 + 帧末 NAL 才置 marker
       rtp_packet->header.markerbit = is_last;
@@ -104,17 +138,17 @@ static int rtp_encoder_encode_h264_fu_a(RtpEncoder* rtp_encoder, uint8_t* buf, s
       LOGI("h264 nalu: type=%d size=%d ts=%u seq=%u marker=%d", type, (int)total_size,
            rtp_encoder->timestamp, rtp_encoder->seq_number, rtp_packet->header.markerbit);
 #endif
-      memcpy(rtp_packet->payload + sizeof(NaluHeader) + sizeof(FuHeader), buf, size);
-      rtp_encoder->on_packet(rtp_encoder->buf, size + sizeof(RtpHeader) + sizeof(NaluHeader) + sizeof(FuHeader), rtp_encoder->user_data);
+      memcpy(payload + sizeof(NaluHeader) + sizeof(FuHeader), buf, size);
+      rtp_encoder->on_packet(rtp_encoder->buf, size + rtp_h264_header_size(rtp_encoder) + sizeof(NaluHeader) + sizeof(FuHeader), rtp_encoder->user_data);
       break;
     }
 
     fu_header->e = 0;
 
-    memcpy(rtp_packet->payload + sizeof(NaluHeader) + sizeof(FuHeader), buf, FU_PAYLOAD_SIZE);
+    memcpy(payload + sizeof(NaluHeader) + sizeof(FuHeader), buf, fu_payload_size);
     rtp_encoder->on_packet(rtp_encoder->buf, CONFIG_MTU, rtp_encoder->user_data);
-    size -= FU_PAYLOAD_SIZE;
-    buf += FU_PAYLOAD_SIZE;
+    size -= fu_payload_size;
+    buf += fu_payload_size;
 
     fu_header->s = 0;
   }
@@ -158,7 +192,7 @@ static int rtp_encoder_encode_h264(RtpEncoder* rtp_encoder, uint8_t* buf, size_t
     }
 
     sent = 1;
-    if (nalu_size <= RTP_PAYLOAD_SIZE) {
+    if (nalu_size <= CONFIG_MTU - rtp_h264_header_size(rtp_encoder)) {
       rtp_encoder_encode_h264_single(rtp_encoder, pstart, nalu_size, pend == buf_end);
     } else {
       rtp_encoder_encode_h264_fu_a(rtp_encoder, pstart, nalu_size, pend == buf_end);
@@ -197,6 +231,7 @@ void rtp_encoder_init(RtpEncoder* rtp_encoder, MediaCodec codec, RtpOnPacket on_
   rtp_encoder->user_data = user_data;
   rtp_encoder->timestamp = 0;
   rtp_encoder->seq_number = 0;
+  rtp_encoder->abs_send_time_id = 0;
 
   switch (codec) {
     case CODEC_H264:
