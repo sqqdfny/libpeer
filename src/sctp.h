@@ -145,8 +145,17 @@ typedef enum SctpDataPpid {
 } SctpDataPpid;
 
 #define SCTP_MAX_STREAMS 5
-#define SCTP_SINGLE_MESSAGE_MAX 1152
-#define SCTP_TX_SLOTS 8
+/* 当前带外协商路径不做 SCTP 消息分片；扣除公共头 12B、DATA 头 16B，
+ * 并为 DATA chunk 尾部保留四字节对齐空间。应用缓冲容量由构建配置给出。 */
+#define SCTP_SINGLE_CHUNK_CAPACITY ((((SCTP_MTU - 12u) / 4u) * 4u) - 16u)
+#ifndef WEBRTC_DC_MAX_MESSAGE_SIZE
+#define WEBRTC_DC_MAX_MESSAGE_SIZE SCTP_SINGLE_CHUNK_CAPACITY
+#endif
+#if WEBRTC_DC_MAX_MESSAGE_SIZE < 1 || WEBRTC_DC_MAX_MESSAGE_SIZE > SCTP_SINGLE_CHUNK_CAPACITY
+#error "DataChannel buffer capacity exceeds this single-chunk SCTP path"
+#endif
+#define SCTP_SINGLE_MESSAGE_MAX WEBRTC_DC_MAX_MESSAGE_SIZE
+#define SCTP_TX_SLOTS 16
 #define SCTP_SEND_BUSY (-2)
 #define SCTP_SEND_INVALID (-3)
 

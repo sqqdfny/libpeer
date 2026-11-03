@@ -80,7 +80,8 @@ void agent_get_local_description(Agent* agent, char* description, int length);
 
 int agent_send(Agent* agent, const uint8_t* buf, int len);
 
-int agent_recv(Agent* agent, uint8_t* buf, int len);
+/* timeout_ms为0时只取已到达的数据，由调用者统一安排空闲等待。 */
+int agent_recv(Agent* agent, uint8_t* buf, int len, int timeout_ms);
 
 void agent_set_remote_description(Agent* agent, char* description);
 

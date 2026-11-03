@@ -207,7 +207,7 @@ static int peer_connection_dtls_srtp_recv(void* ctx, unsigned char* buf, size_t 
     return ret;
   }
   if (pc->state == PEER_CONNECTION_CONNECTED) {
-    int ret = agent_recv(&pc->agent, buf, len);
+    int ret = agent_recv(&pc->agent, buf, len, 1);
     if (ret > 0) return ret;
   }
   /* UDP 暂时无数据或 STUN 被 agent 消费并非 EOF。 */
@@ -513,6 +513,26 @@ int peer_connection_datachannel_send_ex(PeerConnection* pc, const void* message,
                              type == DATA_CHANNEL_STRING ? PPID_STRING : PPID_BINARY, sid);
 }
 
+int peer_connection_get_datachannel_send_budget(PeerConnection* pc, PeerDatachannelSendBudget* budget) {
+  if (!budget) return -1;
+  memset(budget, 0, sizeof(*budget));
+  if (!pc || !pc->sctp.negotiated || !pc->sctp.connected) return -1;
+#if CONFIG_USE_USRSCTP
+  return -1;
+#else
+  budget->max_message = SCTP_SINGLE_MESSAGE_MAX;
+  if (pc->remote_message_max && pc->remote_message_max < budget->max_message)
+    budget->max_message = pc->remote_message_max;
+  budget->cwnd_bytes = pc->sctp.cwnd;
+  budget->peer_rwnd_bytes = pc->sctp.peer_rwnd;
+  for (unsigned i = 0; i < SCTP_TX_SLOTS; i++) {
+    if (!pc->sctp.tx[i].state) budget->free_slots++;
+    if (pc->sctp.tx[i].state == 1) budget->flight_bytes += pc->sctp.tx[i].bytes;
+  }
+  return 0;
+#endif
+}
+
 static void peer_connection_message_ex(char* msg, size_t len, void* userdata, uint16_t sid, SctpDataPpid type) {
   PeerConnection* pc = (PeerConnection*)userdata;
   if (pc->onmessage_ex) pc->onmessage_ex(msg, len, pc->config.user_data, sid,
@@ -604,7 +624,7 @@ int peer_connection_loop(PeerConnection* pc) {
              * send USE‑CANDIDATE, and establish connectivity.
              */
             uint8_t buf[1400];
-            agent_recv(&pc->agent, buf, sizeof(buf));
+            agent_recv(&pc->agent, buf, sizeof(buf), 1);
         }
         if (pc->agent.candidate_pairs_num == 0) {
             /**
@@ -665,7 +685,8 @@ int peer_connection_loop(PeerConnection* pc) {
       break;
     case PEER_CONNECTION_COMPLETED:
       for (int i = 0; i < PEER_CONNECTION_RECV_BURST; i++) {
-        if ((pc->agent_ret = agent_recv(&pc->agent, pc->agent_buf, sizeof(pc->agent_buf))) <= 0) {
+        /* 已连接阶段不在收包中等待，避免推迟已就绪的控制和文件发送。 */
+        if ((pc->agent_ret = agent_recv(&pc->agent, pc->agent_buf, sizeof(pc->agent_buf), 0)) <= 0) {
           break;
         }
         LOGD("agent_recv %d", pc->agent_ret);

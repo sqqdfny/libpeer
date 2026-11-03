@@ -47,6 +47,12 @@ typedef struct PeerBandwidthEstimate {
   uint64_t audio_bytes_sent;
 } PeerBandwidthEstimate;
 
+/* negotiated 单包路径的只读发送快照。flight只含state1，槽位仍计state2/3；
+ * cwnd/rwnd为原始窗口字节，flight含每条16字节DATA头，不含common头及下层封装。 */
+typedef struct PeerDatachannelSendBudget {
+  uint32_t max_message, flight_bytes, cwnd_bytes, peer_rwnd_bytes, free_slots;
+} PeerDatachannelSendBudget;
+
 typedef enum DataChannelType {
 
   DATA_CHANNEL_NONE = 0,
@@ -94,7 +100,7 @@ typedef struct PeerConfiguration {
   MediaCodec video_codec;
   DataChannelType datachannel;
   /* 双方固定 SID、negotiated:true、ordered:false、maxRetransmits:0。
-   * 此模式只支持 <=1152 字节的单 DATA 消息，不做应用数据重传/重组。 */
+   * 此模式只支持本地配置及路径上限内的单 DATA 消息，不做应用数据重传/重组。 */
   int datachannel_negotiated;
 
   void (*onaudiotrack)(uint8_t* data, size_t size, void* userdata);
@@ -143,6 +149,8 @@ int peer_connection_register_datachannel(PeerConnection* pc, const char* label, 
 /* 返回完整长度（空消息为 0），-1 未连接，-2 忙可重试，-3 参数/长度无效。 */
 int peer_connection_datachannel_send_ex(PeerConnection* pc, const void* message, size_t len,
                                         uint16_t sid, DataChannelType type);
+/* 与loop/send共用外部锁；复制快照。旧路径/usrsctp/未连接返回-1且清零。 */
+int peer_connection_get_datachannel_send_budget(PeerConnection* pc, PeerDatachannelSendBudget* budget);
 /* 数据借用至回调返回；二进制中零字节和空消息均保留。 */
 void peer_connection_ondatachannelmessage(PeerConnection* pc,
     void (*onmessage)(char*, size_t, void*, uint16_t, DataChannelType));
